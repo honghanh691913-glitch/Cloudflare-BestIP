@@ -1,5 +1,7 @@
 let cfg;
 let runtime = {sources:{}, targets:{}};
+let buildInfo = {version:'dev',commit:'unknown',built_at:'unknown',web_update_ready:false};
+let updateCheck = null;
 let statusTimer;
 let currentView = 'tasks';
 let toastTimer;
@@ -45,10 +47,16 @@ function toast(msg, bad=false) {
 
 async function load() {
   try {
-    cfg = await api('/api/config');
+    const [nextCfg, nextBuild] = await Promise.all([
+      api('/api/config'),
+      api('/api/version?ts=' + Date.now()).catch(() => buildInfo)
+    ]);
+    cfg = nextCfg;
+    buildInfo = nextBuild || buildInfo;
     cfg.providers ||= [];
     cfg.sources ||= [];
     cfg.targets ||= [];
+    renderVersionBadge();
     renderAll();
     await refreshStatus();
     clearInterval(statusTimer);
@@ -56,6 +64,25 @@ async function load() {
   } catch (e) {
     toast(`加载失败：${e.message}`, true);
   }
+}
+
+function shortCommit(v) {
+  v = String(v || 'unknown');
+  return v.length > 8 ? v.slice(0,8) : v;
+}
+
+function compactError(v) {
+  let s = String(v || '').replace(/\r/g,' ').replace(/\n+/g,' ').replace(/\s+/g,' ').trim();
+  const helpAt = s.indexOf('参数：');
+  if (helpAt > 0) s = s.slice(0, helpAt).trim();
+  if (s.length > 220) s = s.slice(0,220) + '…';
+  return s;
+}
+
+function renderVersionBadge() {
+  const eyebrow = document.querySelector('.eyebrow');
+  if (!eyebrow) return;
+  eyebrow.innerHTML = `BESTIP MANAGER <span class="version-badge">${esc(buildInfo.version || 'dev')} · ${esc(shortCommit(buildInfo.commit))}</span>`;
 }
 
 function renderAll() {
@@ -90,9 +117,9 @@ function taskRunning(t) { return taskLines(t).some(x => runtime.sources?.[x.sour
 function taskError(t) {
   for (const x of taskLines(t)) {
     const e = runtime.sources?.[x.source.id]?.error;
-    if (e) return e;
+    if (e) return compactError(e);
   }
-  return runtime.targets?.[t.id]?.ok === false ? runtime.targets[t.id].error : '';
+  return runtime.targets?.[t.id]?.ok === false ? compactError(runtime.targets[t.id].error) : '';
 }
 
 function renderTasks() {
@@ -221,7 +248,25 @@ function mask(v) {
 
 function renderSettings() {
   const panel = $('#settingsPanel');
+  const updateReady = !!buildInfo.web_update_ready;
+  const available = !!updateCheck?.update_available;
+  const latest = updateCheck?.latest_commit ? shortCommit(updateCheck.latest_commit) : '未检查';
   panel.innerHTML = `
+    <div class="settings-card update-card">
+      <div class="update-head">
+        <div>
+          <div class="mini-label">当前版本</div>
+          <div class="version-title">${esc(buildInfo.version || 'dev')} <span>${esc(shortCommit(buildInfo.commit))}</span></div>
+          <div class="help">构建：${esc(buildInfo.built_at || 'unknown')} · 最新 main：${esc(latest)}</div>
+        </div>
+        <span class="update-state ${available?'available':''}">${available?'有新版本':'版本状态'}</span>
+      </div>
+      <div id="updateMessage" class="modal-note">${updateReady ? '已启用 Web 一键更新。更新时页面会短暂断开并自动恢复。' : '当前未挂载 Docker Socket，只能检查版本；换用新版 Compose 后即可一键更新。'}</div>
+      <div class="grid2 update-actions">
+        <button id="checkUpdateBtn" class="ghost">检查更新</button>
+        <button id="applyUpdateBtn" class="primary" ${updateReady?'':'disabled'}>${available?'更新到最新版':'重新拉取最新版'}</button>
+      </div>
+    </div>
     <div class="settings-card">
       <div class="settings-row"><label>最大并发测速任务</label><input id="setConcurrency" type="number" min="1" max="64" value="${Number(cfg.max_concurrency || 2)}"></div>
       <div class="help">建议 1–3。修改后保存并重启容器，新的任务槽数量才会完全生效。</div>
@@ -236,6 +281,8 @@ function renderSettings() {
         <div class="grid2" style="margin-top:9px"><button id="copyRaw" class="ghost">复制 JSON</button><button id="applyRaw" class="danger-btn">应用 JSON</button></div>
       </details>
     </div>`;
+  $('#checkUpdateBtn').onclick = checkForUpdate;
+  $('#applyUpdateBtn').onclick = applyWebUpdate;
   $('#saveGlobal').onclick = async () => {
     cfg.max_concurrency = Math.max(1, Number($('#setConcurrency').value) || 2);
     cfg.listen = $('#setListen')?.value.trim() || cfg.listen || ':8080';
@@ -253,6 +300,59 @@ function renderSettings() {
       renderAll();
     } catch (e) { toast(e.message, true); }
   };
+}
+
+async function checkForUpdate() {
+  const msg = $('#updateMessage');
+  if (msg) msg.textContent = '正在检查 GitHub main…';
+  try {
+    updateCheck = await api('/api/update/check?ts=' + Date.now());
+    buildInfo = updateCheck.current || buildInfo;
+    renderVersionBadge();
+    renderSettings();
+    toast(updateCheck.update_available ? '发现新版本' : '当前已是最新 main');
+  } catch (e) {
+    if (msg) msg.textContent = `检查失败：${e.message}`;
+    toast(`检查更新失败：${e.message}`, true);
+  }
+}
+
+async function applyWebUpdate() {
+  if (!buildInfo.web_update_ready) return toast('请先换用启用 Docker Socket 的新版 Compose', true);
+  if (!confirm('更新会拉取 latest 镜像并重建 BestIP 容器，页面会短暂断开。继续吗？')) return;
+  const oldCommit = String(buildInfo.commit || '');
+  const btn = $('#applyUpdateBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '正在拉取…'; }
+  try {
+    await api('/api/update/apply', {method:'POST'});
+    toast('已启动更新，等待服务重新上线');
+    waitForUpdatedService(oldCommit);
+  } catch (e) {
+    toast(`更新失败：${e.message}`, true);
+    renderSettings();
+  }
+}
+
+function waitForUpdatedService(oldCommit) {
+  let tries = 0;
+  const timer = setInterval(async () => {
+    tries++;
+    try {
+      const next = await api('/api/version?ts=' + Date.now());
+      if (next?.commit && (next.commit !== oldCommit || tries > 5)) {
+        clearInterval(timer);
+        buildInfo = next;
+        renderVersionBadge();
+        toast(`更新完成：${next.version} · ${shortCommit(next.commit)}`);
+        setTimeout(() => location.reload(), 900);
+      }
+    } catch (_) {}
+    if (tries >= 60) {
+      clearInterval(timer);
+      toast('更新等待超时，请刷新页面确认版本', true);
+      renderSettings();
+    }
+  }, 2500);
 }
 
 async function saveConfig(okText='已保存') {

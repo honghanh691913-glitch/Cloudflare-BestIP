@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+# Update helper must start immediately: it does not need config or CFST.
+if [ "${BESTIP_UPDATE_HELPER:-}" = "1" ]; then
+  exec /usr/local/bin/bestip-manager
+fi
+
 CONFIG_PATH="${BESTIP_CONFIG:-/data/config.json}"
 
 if [ ! -f "$CONFIG_PATH" ]; then
