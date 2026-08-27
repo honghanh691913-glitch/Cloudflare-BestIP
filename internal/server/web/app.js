@@ -5,6 +5,7 @@ let updateCheck = null;
 let statusTimer;
 let currentView = 'tasks';
 let toastTimer;
+let scanDetailSourceId = '';
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -122,6 +123,36 @@ function taskError(t) {
   return runtime.targets?.[t.id]?.ok === false ? compactError(runtime.targets[t.id].error) : '';
 }
 
+function phaseLabel(st={}) {
+  const stage = String(st.stage || '').trim();
+  if (stage) return stage;
+  const p = st.progress?.phase;
+  return ({probe:'预扫描',main:'正式测速',done:'完成'})[p] || '等待';
+}
+function progressText(st={}) {
+  const p = st.progress || {};
+  if (!st.running) return `${st.results?.length || 0} 条`;
+  const bits = [phaseLabel(st)];
+  if (p.total > 0) bits.push(`${p.percent || 0}%`, `${p.current || 0}/${p.total}`);
+  return bits.join(' · ');
+}
+function taskProgress(t) {
+  const running = taskLines(t).map(x => runtime.sources?.[x.source.id]).filter(st => st?.running);
+  if (!running.length) return 0;
+  return Math.max(...running.map(st => Number(st.progress?.percent || 0)));
+}
+function fmtNum(v, digits=1) {
+  const n = Number(v || 0);
+  return Number.isFinite(n) ? n.toFixed(digits) : '0';
+}
+function fmtLoss(v) { return `${Math.round(Number(v || 0) * 100)}%`; }
+function observedStatus(r={}) {
+  if (r.qualified) return ['达标','ok'];
+  const reason = String(r.reject_reason || '');
+  if (reason.includes('等待')) return ['待确认','waiting'];
+  return ['未达标','bad'];
+}
+
 function renderTasks() {
   const list = $('#taskList');
   const targets = cfg.targets || [];
@@ -141,10 +172,11 @@ function renderTasks() {
   targets.forEach(t => {
     const lines = taskLines(t);
     const runningNow = taskRunning(t);
+    const pct = taskProgress(t);
     const err = taskError(t);
     const synced = runtime.targets?.[t.id];
     let stateClass = runningNow ? 'running' : err ? 'bad' : synced?.ok ? 'ok' : '';
-    let stateText = runningNow ? '优选中' : err ? '有错误' : synced?.ok ? '已同步' : '待运行';
+    let stateText = runningNow ? `优选中${pct ? ` ${pct}%` : ''}` : err ? '有错误' : synced?.ok ? '已同步' : '待运行';
     const chips = [];
     [...new Set(lines.map(x => x.source.family))].forEach(f => chips.push(`<span class="chip ${f==='ipv6'?'v6':'v4'}">${recordType(f)} ${fmtFamily(f)}</span>`));
     [...new Set(lines.flatMap(x => x.source.cfst?.colo || []))].slice(0,3).forEach(c => chips.push(`<span class="chip colo">${esc(c)}</span>`));
@@ -152,17 +184,23 @@ function renderTasks() {
     if (p) chips.push(`<span class="chip">${esc(p.name || 'Cloudflare')}</span>`);
 
     const lineRows = lines.map(x => {
-      const s = x.source;
-      const st = runtime.sources?.[s.id] || {};
+      const src = x.source;
+      const st = runtime.sources?.[src.id] || {};
+      const pg = st.progress || {};
       const meta = [
-        (s.cfst?.colo || []).join(','),
+        (src.cfst?.colo || []).join(','),
         `${x.ref.count || 1} 个`,
-        fmtInterval(s.interval_minutes)
+        fmtInterval(src.interval_minutes)
       ].filter(Boolean).join(' · ');
-      return `<div class="line-row">
-        <span class="line-family">${recordType(s.family)}</span>
-        <span class="line-meta">${esc(s.name || lineTitle(s))}${meta ? ` · ${esc(meta)}` : ''}</span>
-        <span class="line-result">${st.running ? '测速中' : `${st.results?.length || 0} 条`}</span>
+      return `<div class="line-status-block" data-source-detail="${esc(src.id)}">
+        <div class="line-row clickable">
+          <span class="line-family">${recordType(src.family)}</span>
+          <span class="line-meta">${esc(src.name || lineTitle(src))}${meta ? ` · ${esc(meta)}` : ''}</span>
+          <span class="line-result">${esc(progressText(st))}</span>
+        </div>
+        ${st.running ? `<div class="progress-track"><i style="width:${Math.max(2,Math.min(100,Number(pg.percent || 0)))}%"></i></div>
+          <div class="progress-mini"><span>已扫 ${pg.current || 0}${pg.total ? ` / ${pg.total}` : ''}</span><span>可用 ${pg.available || 0}</span><span>点此看详情</span></div>` :
+          (st.observed_total ? `<div class="progress-mini"><span>观察到 ${st.observed_total} 个</span><span>达标 ${st.results?.length || 0}</span><span>点此看详情</span></div>` : '')}
       </div>`;
     }).join('') || `<div class="line-row"><span class="line-meta">尚未配置 IP 线路</span></div>`;
 
@@ -187,8 +225,69 @@ function renderTasks() {
     d.querySelector('[data-run]').onclick = () => runTask(t);
     d.querySelector('[data-sync]').onclick = () => syncTask(t);
     d.querySelector('[data-edit]').onclick = () => openTaskEditor(t.id);
+    d.querySelectorAll('[data-source-detail]').forEach(el => el.onclick = () => openScanDetail(el.dataset.sourceDetail));
     list.appendChild(d);
   });
+}
+
+function openScanDetail(sourceId) {
+  scanDetailSourceId = sourceId;
+  const src = sourceById(sourceId);
+  const root = $('#modalRoot');
+  root.innerHTML = `<div class="overlay" id="scanOverlay"><div class="sheet scan-sheet">
+    <div class="sheet-head"><div><h3>${esc(src?.name || '扫描详情')}</h3><div class="help">${esc(src?.family || '')} · ${esc((src?.cfst?.colo || []).join(',') || '不限地区')}</div></div><button class="sheet-close" data-close>×</button></div>
+    <div class="sheet-body" id="scanDetailBody"></div>
+  </div></div>`;
+  root.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
+  $('#scanOverlay').onclick = e => { if (e.target.id === 'scanOverlay') closeModal(); };
+  renderScanDetail();
+}
+
+function renderScanDetail() {
+  if (!scanDetailSourceId) return;
+  const body = $('#scanDetailBody');
+  if (!body) return;
+  const src = sourceById(scanDetailSourceId);
+  const st = runtime.sources?.[scanDetailSourceId] || {};
+  const pg = st.progress || {};
+  const rows = st.observed || [];
+  const logs = st.logs || [];
+  const pct = Number(pg.percent || (st.running ? 0 : st.results?.length ? 100 : 0));
+
+  const resultRows = rows.length ? rows.slice(0,500).map(r => {
+    const [label, cls] = observedStatus(r);
+    return `<div class="scan-result-row">
+      <div class="scan-ip">${esc(r.ip || '')}<span class="scan-badge ${cls}">${label}</span></div>
+      <div class="scan-metrics">
+        <span>${r.latency_ms ? `${fmtNum(r.latency_ms)} ms` : '— ms'}</span>
+        <span>丢包 ${fmtLoss(r.loss)}</span>
+        <span>${r.speed_mb ? `${fmtNum(r.speed_mb,2)} MB/s` : '未测速'}</span>
+        <span>${esc(r.colo || '—')}</span>
+      </div>
+      ${r.reject_reason ? `<div class="scan-reason">${esc(r.reject_reason)}</div>` : ''}
+    </div>`;
+  }).join('') : `<div class="empty mini"><b>还没有 IP 明细</b>${st.running ? '正在预扫描，结果出现后会自动刷新。' : '点击“立即优选”开始扫描。'}</div>`;
+
+  body.innerHTML = `
+    <div class="scan-live-card">
+      <div class="scan-live-head"><div><div class="mini-label">当前阶段</div><b>${esc(phaseLabel(st))}</b></div><span class="scan-live-state ${st.running?'running':st.error?'bad':'ok'}">${st.running?'运行中':st.error?'失败':'完成'}</span></div>
+      <div class="progress-track large"><i style="width:${Math.max(0,Math.min(100,pct))}%"></i></div>
+      <div class="scan-stats">
+        <div><b>${pg.current || 0}${pg.total ? `/${pg.total}` : ''}</b><span>已扫描</span></div>
+        <div><b>${pg.available || 0}</b><span>可连通</span></div>
+        <div><b>${st.observed_total || rows.length || 0}</b><span>观察结果</span></div>
+        <div><b>${st.results?.length || 0}</b><span>最终达标</span></div>
+      </div>
+      ${st.error ? `<div class="scan-error">${esc(compactError(st.error))}</div>` : ''}
+    </div>
+
+    <div class="scan-section-head"><b>IP 扫描明细</b><span>显示最多 500 条 · 包含未达标</span></div>
+    <div class="scan-results">${resultRows}</div>
+
+    <details class="scan-log-box" open>
+      <summary>实时日志 · 最近 ${logs.length} 条</summary>
+      <pre>${esc(logs.join('\n') || '等待日志…')}</pre>
+    </details>`;
 }
 
 async function runTask(t) {
@@ -214,6 +313,7 @@ async function refreshStatus() {
   try {
     runtime = await api('/api/status');
     if (currentView === 'tasks') renderTasks();
+    if (scanDetailSourceId) renderScanDetail();
   } catch (_) {}
 }
 
@@ -428,7 +528,7 @@ function openTaskEditor(targetId='') {
         </div>
         <label class="field"><span>IP 段 / IP 源</span><textarea data-inputs placeholder="每行一个，可填 URL、CIDR 或单个 IP">${esc((s.inputs || []).join('\n'))}</textarea></label>
         <div class="grid3">
-          <label class="field"><span>Colo / 地区（可空）</span><input data-colo value="${esc((s.cfst.colo || []).join(','))}" placeholder="NRT"></label>
+          <label class="field"><span>结果地区（可空）</span><input data-colo value="${esc((s.cfst.colo || []).join(','))}" placeholder="NRT"><small>先测速，再按实际 Colo 结果筛选；不会再用 HTTPing 提前淘汰。</small></label>
           <label class="field"><span>写入数量</span><input data-count type="number" min="1" max="100" value="${Number(ref.count || 5)}"></label>
           <label class="field"><span>自动周期</span><select data-interval>
             ${intervalOptions(s.interval_minutes)}
@@ -445,7 +545,7 @@ function openTaskEditor(targetId='') {
           </div>
           <label class="field"><span>测速 URL</span><input data-url value="${esc(s.cfst.url || DEFAULT_CFST.url)}"></label>
           <div class="grid2">
-            <label class="field"><span>HTTPing</span><select data-httping><option value="true" ${s.cfst.httping?'selected':''}>开启</option><option value="false" ${!s.cfst.httping?'selected':''}>关闭</option></select></label>
+            <label class="field"><span>HTTPing（无地区筛选时）</span><select data-httping><option value="true" ${s.cfst.httping?'selected':''}>开启</option><option value="false" ${!s.cfst.httping?'selected':''}>关闭</option></select></label>
             <label class="field"><span>All IP</span><select data-allip><option value="false" ${!s.cfst.all_ip?'selected':''}>关闭</option><option value="true" ${s.cfst.all_ip?'selected':''}>开启</option></select></label>
           </div>
         </details>`;
@@ -597,7 +697,7 @@ async function deleteProvider(id) {
   await saveConfig('DNS 账号已删除');
 }
 
-function closeModal() { $('#modalRoot').innerHTML = ''; }
+function closeModal() { scanDetailSourceId = ''; $('#modalRoot').innerHTML = ''; }
 
 function switchView(view) {
   currentView = view;

@@ -44,9 +44,11 @@ func main() {
 	srv := &http.Server{Addr: cfg.Listen, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	log.Printf("[startup] BestIP Manager version=%s commit=%s listen=%s config=%s sources=%d targets=%d providers=%d concurrency=%d web_update=%v",
+		buildinfo.Version, short(buildinfo.Commit), cfg.Listen, cfgPath, len(cfg.Sources), len(cfg.Targets), len(cfg.Providers), cfg.MaxConcurrency, updater.Available())
 	go app.Scheduler(ctx)
 	go func() {
-		log.Printf("BestIP Manager %s (%s) listening on %s", buildinfo.Version, short(buildinfo.Commit), cfg.Listen)
+		log.Printf("[startup] HTTP server listening on %s", cfg.Listen)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}

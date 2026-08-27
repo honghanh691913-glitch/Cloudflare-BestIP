@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -214,6 +215,7 @@ func (a *App) runSourceHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, fmt.Errorf("source not found"))
 		return
 	}
+	log.Printf("[api] manual scan requested source=%s name=%q", src.ID, src.Name)
 	go a.runAndPublish(*src)
 	writeJSON(w, 202, map[string]any{"ok": true})
 }
@@ -224,6 +226,7 @@ func (a *App) runAllHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := a.Store.Get()
+	log.Printf("[api] run-all requested sources=%d", len(c.Sources))
 	for _, s := range c.Sources {
 		if s.Enabled {
 			ss := s
@@ -247,13 +250,20 @@ func (a *App) syncTargetHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) runAndPublish(s config.Source) {
+	log.Printf("[queue] source=%s waiting for slot", s.ID)
 	a.slots <- struct{}{}
 	defer func() { <-a.slots }()
+	log.Printf("[queue] source=%s acquired slot", s.ID)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
+	started := time.Now()
 	if err := a.Engine.RunSource(ctx, s); err != nil {
+		log.Printf("[scan] source=%s failed after %s: %v", s.ID, time.Since(started).Round(time.Millisecond), err)
 		return
 	}
+	log.Printf("[scan] source=%s completed after %s; checking DNS targets", s.ID, time.Since(started).Round(time.Millisecond))
+
 	c := a.Store.Get()
 	for _, t := range c.Targets {
 		if !t.Enabled {
@@ -261,7 +271,9 @@ func (a *App) runAndPublish(s config.Source) {
 		}
 		for _, ref := range t.Sources {
 			if ref.SourceID == s.ID {
-				_ = a.syncTarget(context.Background(), t.ID)
+				if err := a.syncTarget(context.Background(), t.ID); err != nil {
+					log.Printf("[dns] target=%s host=%s sync failed: %v", t.ID, t.Hostname, err)
+				}
 				break
 			}
 		}
@@ -280,6 +292,7 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	if t == nil {
 		return fmt.Errorf("target not found")
 	}
+	log.Printf("[dns] sync start target=%s host=%s", t.ID, t.Hostname)
 	var p *config.Provider
 	for i := range c.Providers {
 		if c.Providers[i].ID == t.ProviderID {
@@ -298,6 +311,11 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		}
 	}
 	err := a.dns.SyncTarget(ctx, *p, *t, latest)
+	if err != nil {
+		log.Printf("[dns] sync failed target=%s host=%s: %v", t.ID, t.Hostname, err)
+	} else {
+		log.Printf("[dns] sync success target=%s host=%s", t.ID, t.Hostname)
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	st := map[string]any{"time": time.Now(), "ok": err == nil}
@@ -325,6 +343,7 @@ func (a *App) Scheduler(ctx context.Context) {
 				if time.Since(last[s.ID]) >= time.Duration(s.IntervalMinutes)*time.Minute {
 					last[s.ID] = time.Now()
 					ss := s
+					log.Printf("[scheduler] trigger source=%s interval=%dm", s.ID, s.IntervalMinutes)
 					go a.runAndPublish(ss)
 				}
 			}
