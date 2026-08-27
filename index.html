@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b0f14">
+  <title>BestIP</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">BESTIP MANAGER</div>
+        <h1 id="pageTitle">域名任务</h1>
+      </div>
+      <div class="top-actions">
+        <button id="refreshBtn" class="icon-btn" aria-label="刷新">↻</button>
+        <button id="addTaskBtn" class="primary compact">＋ 新建</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="viewTasks" class="view active">
+        <div id="summary" class="summary-strip"></div>
+        <div id="taskList" class="task-list"></div>
+      </section>
+
+      <section id="viewAccount" class="view">
+        <div class="section-head">
+          <div>
+            <h2>DNS 账号</h2>
+            <p>账号只配置一次，新建域名任务时直接选择。</p>
+          </div>
+          <button id="addProviderBtn" class="primary compact">＋ 添加</button>
+        </div>
+        <div id="providerList" class="stack"></div>
+      </section>
+
+      <section id="viewSettings" class="view">
+        <div class="section-head">
+          <div>
+            <h2>设置</h2>
+            <p>这里只保留全局参数，日常基本不用动。</p>
+          </div>
+        </div>
+        <div id="settingsPanel"></div>
+      </section>
+    </main>
+
+    <nav class="bottom-nav" aria-label="主导航">
+      <button class="nav-item active" data-view="tasks"><span>◉</span><b>任务</b></button>
+      <button class="nav-item" data-view="account"><span>◎</span><b>我的</b></button>
+      <button class="nav-item" data-view="settings"><span>⚙</span><b>设置</b></button>
+    </nav>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toast" class="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
