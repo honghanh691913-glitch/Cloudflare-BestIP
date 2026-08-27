@@ -1,0 +1,22 @@
+BestIP GHCR 快速更新版
+
+需要上传到 GitHub 仓库的文件：
+1. Dockerfile                  （覆盖）
+2. scripts/entrypoint.sh       （覆盖）
+3. .github/workflows/docker-image.yml （新增）
+
+然后：
+1. GitHub -> Actions，等待 “Build BestIP Docker” 成功。
+2. 如果 GHCR 包第一次是 Private：
+   GitHub -> 你的 Profile -> Packages -> cloudflare-bestip -> Package settings
+   -> Change visibility -> Public。
+3. 飞牛只使用本包中的 docker-compose.yml。
+
+以后更新流程：
+- 只要上传代码到 GitHub main。
+- GitHub Actions 自动构建镜像。
+- 等 Actions 成功后，在飞牛执行“重新拉取/重新创建”，或者命令：
+    docker compose pull
+    docker compose up -d
+
+不再需要在飞牛本地 build。
