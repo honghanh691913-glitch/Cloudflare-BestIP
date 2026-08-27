@@ -1,0 +1,13 @@
+services:
+  bestip-manager:
+    build: .
+    container_name: bestip-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: Asia/Shanghai
+      BESTIP_WEB_USER: admin
+      BESTIP_WEB_PASS: change-me
+    volumes:
+      - ./data:/data

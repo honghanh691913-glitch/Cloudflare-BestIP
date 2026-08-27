@@ -1,0 +1,4 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BestIP Manager</title><link rel="stylesheet" href="/app.css"></head><body>
+<header><div><h1>BestIP Manager</h1><p>IP 池与 DNS 域名解耦 · IPv4 / IPv6 / Colo 任意组合</p></div><div class="actions"><button id="runAll">全部测速</button><button id="save" class="primary">保存配置</button></div></header>
+<main><section><h2>运行状态</h2><div id="status" class="grid"></div></section><section><h2>IP 池 / Sources</h2><div id="sources"></div><button id="addSource">+ 新增 IP 池</button></section><section><h2>DNS 目标 / Targets</h2><div id="targets"></div><button id="addTarget">+ 新增域名目标</button></section><section><details><summary>高级：完整 JSON 配置</summary><textarea id="raw"></textarea><button id="applyRaw">从 JSON 应用到表单</button></details></section></main>
+<script src="/app.js"></script></body></html>
