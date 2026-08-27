@@ -19,6 +19,4 @@ services:
 
     volumes:
       - ./bestip-manager-data:/data
-      # Web 一键更新需要 Docker Engine API。
-      # 注意：Docker Socket 等价于较高宿主机权限，只应在你自己的可信 NAS 上使用。
       - /var/run/docker.sock:/var/run/docker.sock
