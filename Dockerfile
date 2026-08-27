@@ -1,7 +1,15 @@
 FROM golang:1.23-alpine AS build
 WORKDIR /src
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/bestip-manager ./cmd/bestip
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILT_AT=unknown
+RUN CGO_ENABLED=0 go build -trimpath \
+  -ldflags="-s -w \
+  -X github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/buildinfo.Version=${VERSION} \
+  -X github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/buildinfo.Commit=${COMMIT} \
+  -X github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/buildinfo.BuiltAt=${BUILT_AT}" \
+  -o /out/bestip-manager ./cmd/bestip
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates curl tzdata tar

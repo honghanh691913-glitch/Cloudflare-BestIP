@@ -1,0 +1,24 @@
+services:
+  bestip-manager:
+    image: ghcr.io/honghanh691913-glitch/cloudflare-bestip:latest
+    container_name: bestip-manager
+    restart: unless-stopped
+
+    network_mode: bridge
+
+    ports:
+      - "18080:8080"
+
+    environment:
+      TZ: "Asia/Shanghai"
+      BESTIP_WEB_USER: "admin"
+      BESTIP_WEB_PASS: "change-me"
+      BESTIP_CONFIG: "/data/config.json"
+      BESTIP_CONTAINER_NAME: "bestip-manager"
+      BESTIP_UPDATE_IMAGE: "ghcr.io/honghanh691913-glitch/cloudflare-bestip:latest"
+
+    volumes:
+      - ./bestip-manager-data:/data
+      # Web 一键更新需要 Docker Engine API。
+      # 注意：Docker Socket 等价于较高宿主机权限，只应在你自己的可信 NAS 上使用。
+      - /var/run/docker.sock:/var/run/docker.sock

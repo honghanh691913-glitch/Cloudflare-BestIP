@@ -1,0 +1,47 @@
+BestIP Manager v0.3.0
+
+这次请按目录覆盖/新增以下文件：
+- internal/engine/engine.go
+- internal/buildinfo/buildinfo.go        [新增]
+- internal/updater/docker.go             [新增]
+- internal/server/server.go
+- cmd/bestip/main.go
+- internal/server/web/app.js
+- internal/server/web/app.css
+- scripts/entrypoint.sh
+- Dockerfile
+- .github/workflows/main.yml
+
+飞牛 Compose：
+- 使用 docker-compose.web-update.yml 替换当前 Compose。
+
+v0.3.0 修复：
+1. CFST v2.3.5 的 -tl / -tll 改为整数：
+   -tl 200，不再生成 -tl 200.00
+2. 有 Colo 时自动开启 HTTPing。
+3. 加入 -p 0，减少终端无用输出。
+4. CFST 错误只显示关键一两行，不再把整份帮助塞满任务卡。
+5. 静态前端禁止缓存，避免更新后仍看到旧 JS/CSS。
+6. Web 显示：
+   v0.3.0 · Git Commit
+7. 设置页增加：
+   - 检查更新
+   - 一键更新
+8. 一键更新失败时尽量回滚到旧容器。
+
+Web 一键更新说明：
+- 新 Compose 会挂载 /var/run/docker.sock。
+- Docker Socket 权限很高，只应部署在你自己的可信 NAS。
+- GHCR 包需要设为 Public，否则飞牛匿名拉取 latest 会失败。
+
+已验证：
+- go test ./... 通过
+- CFST 参数单测通过：
+  -tl 200
+  -tll 40
+  -httping
+  -cfcolo NRT,HKG
+  -p 0
+- node --check app.js 通过
+- entrypoint shell 语法检查通过
+- /api/version 本地启动验证通过
