@@ -1,60 +1,21 @@
 package engine
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
 )
 
-func TestBuildArgsColoUsesPostFilter(t *testing.T) {
-	s := config.Source{
-		Family:      "ipv4",
-		KeepResults: 50,
-		CFST: config.CFST{
-			Threads:       4,
-			PingCount:     200,
-			DownloadCount: 10,
-			LatencyMaxMS:  200,
-			LossMax:       0.2,
-			SpeedMinMB:    5,
-			HTTPing:       true,
-			Colo:          []string{"NRT"},
-			AllIP:         true,
-		},
-	}
-	args := buildArgs(s, "/tmp/in.txt", "/tmp/out.csv")
-	joined := strings.Join(args, " ")
-	if strings.Contains(joined, "-cfcolo") {
-		t.Fatalf("region must not be passed as CFST pre-filter: %s", joined)
-	}
-	if strings.Contains(joined, "-httping") {
-		t.Fatalf("region task should use TCPing/download post-filter: %s", joined)
-	}
-	if !strings.Contains(joined, "-allip") {
-		t.Fatalf("allip flag missing: %s", joined)
-	}
-	if !strings.Contains(joined, "-dn 50") {
-		t.Fatalf("expected wider result pool: %s", joined)
-	}
-	if !strings.Contains(joined, "-tl 200") || strings.Contains(joined, "-tl 200.00") {
-		t.Fatalf("latency flag format wrong: %s", joined)
-	}
-}
-
-func TestFilterResultsByColo(t *testing.T) {
-	in := []Result{
-		{IP: "1.1.1.1", Colo: "NRT"},
-		{IP: "2.2.2.2", Colo: "HKG"},
-		{IP: "3.3.3.3", Colo: "nrt"},
-	}
-	out := filterResultsByColo(in, []string{"NRT"})
-	if len(out) != 2 {
-		t.Fatalf("expected 2 NRT results, got %d", len(out))
-	}
-}
-
-func TestBuildProbeArgsKeepsRejectedCandidatesVisible(t *testing.T) {
+func TestBuildProbeArgsIsLightweightAndAllIP(t *testing.T) {
 	s := config.Source{
 		Family: "ipv4",
 		CFST: config.CFST{
@@ -66,11 +27,61 @@ func TestBuildProbeArgsKeepsRejectedCandidatesVisible(t *testing.T) {
 	joined := strings.Join(buildProbeArgs(s, "/tmp/in.txt", "/tmp/probe.csv"), " ")
 	for _, forbidden := range []string{"-tl ", "-tll ", "-tlr ", "-sl ", "-cfcolo", "-httping"} {
 		if strings.Contains(joined, forbidden) {
-			t.Fatalf("probe must stay relaxed; found %q in %s", forbidden, joined)
+			t.Fatalf("light probe must not pre-filter; found %q in %s", forbidden, joined)
 		}
 	}
 	if !strings.Contains(joined, "-dd") || !strings.Contains(joined, "-allip") {
 		t.Fatalf("probe flags missing: %s", joined)
+	}
+}
+
+func TestSortObservedPinsQualifiedBySpeed(t *testing.T) {
+	rows := []Result{
+		{IP: "pending", LatencyMS: 20},
+		{IP: "slow-good", SpeedTested: true, Qualified: true, SpeedMB: 10, LatencyMS: 30},
+		{IP: "bad", SpeedTested: true, Qualified: false, SpeedMB: 2, LatencyMS: 10},
+		{IP: "fast-good", SpeedTested: true, Qualified: true, SpeedMB: 50, LatencyMS: 40},
+	}
+	got := sortObservedForDisplay(rows)
+	want := []string{"fast-good", "slow-good", "pending", "bad"}
+	for i := range want {
+		if got[i].IP != want[i] {
+			t.Fatalf("row %d = %s, want %s", i, got[i].IP, want[i])
+		}
+	}
+}
+
+func TestFetchColoAndMeasureSpeedAgainstBoundIP(t *testing.T) {
+	payload := strings.Repeat("x", 512*1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cdn-cgi/trace" {
+			fmt.Fprint(w, "fl=1\ncolo=NRT\nip=127.0.0.1\n")
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	_, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	s := config.Source{CFST: config.CFST{
+		URL:          "http://example.test/download",
+		Port:         port,
+		DownloadTime: 1,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	colo, err := fetchColo(ctx, s, "127.0.0.1")
+	if err != nil || colo != "NRT" {
+		t.Fatalf("colo=%q err=%v", colo, err)
+	}
+	speed, err := measureDownloadSpeed(ctx, s, "127.0.0.1")
+	if err != nil || speed <= 0 {
+		t.Fatalf("speed=%v err=%v", speed, err)
 	}
 }
 

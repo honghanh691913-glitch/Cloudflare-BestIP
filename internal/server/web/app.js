@@ -94,6 +94,40 @@ function renderAll() {
 
 function sourceById(id) { return (cfg.sources || []).find(s => s.id === id); }
 function providerById(id) { return (cfg.providers || []).find(p => p.id === id); }
+function normalizeZoneDomain(v) {
+  v = String(v || '').trim().toLowerCase().replace(/^https?:\/\//,'').replace(/^\/+|\/+$/g,'').replace(/\.+$/,'');
+  if (v.includes('/')) v = v.split('/')[0];
+  return v;
+}
+function providerAuthMode(p={}) {
+  const m = String(p.auth_mode || '').toLowerCase();
+  if (['global_api_key','global','api_key'].includes(m)) return 'global_api_key';
+  if (!p.api_token && p.email && p.api_key) return 'global_api_key';
+  return 'api_token';
+}
+function composeHostname(provider, prefix) {
+  const domain = normalizeZoneDomain(provider?.zone_domain || '');
+  let p = String(prefix || '').trim().toLowerCase().replace(/^\.+|\.+$/g,'');
+  if (p === '@') return domain;
+  if (!domain) return p;
+  if (!p) return '';
+  if (p === domain || p.endsWith('.' + domain)) return p;
+  return `${p}.${domain}`;
+}
+function taskPrefixValue(t, provider) {
+  if (String(t?.prefix || '').trim()) return String(t.prefix).trim().toLowerCase();
+  const host = String(t?.hostname || '').trim().toLowerCase().replace(/\.+$/,'');
+  const domain = normalizeZoneDomain(provider?.zone_domain || '');
+  if (!host) return '';
+  if (domain && host === domain) return '@';
+  if (domain && host.endsWith('.' + domain)) return host.slice(0, -(domain.length + 1));
+  return host;
+}
+function taskHostname(t) {
+  const p = providerById(t?.provider_id);
+  const prefix = taskPrefixValue(t, p);
+  return composeHostname(p, prefix) || String(t?.hostname || '').trim().toLowerCase();
+}
 function sourceUseCount(id, exceptTargetId='') {
   return (cfg.targets || []).reduce((n,t) => n + (t.id === exceptTargetId ? 0 : (t.sources || []).filter(r => r.source_id === id).length), 0);
 }
@@ -114,6 +148,13 @@ function lineTitle(source) {
   return colo ? `${fmtFamily(source.family)} · ${colo}` : fmtFamily(source.family);
 }
 function resultCountFor(sourceId) { return runtime.sources?.[sourceId]?.results?.length || 0; }
+function requiredCountForSource(sourceId) {
+  const counts = [];
+  for (const t of (cfg.targets || [])) {
+    for (const r of (t.sources || [])) if (r.source_id === sourceId) counts.push(Number(r.count || 1));
+  }
+  return counts.length ? Math.max(...counts) : 1;
+}
 function taskRunning(t) { return taskLines(t).some(x => runtime.sources?.[x.source.id]?.running); }
 function taskError(t) {
   for (const x of taskLines(t)) {
@@ -127,7 +168,7 @@ function phaseLabel(st={}) {
   const stage = String(st.stage || '').trim();
   if (stage) return stage;
   const p = st.progress?.phase;
-  return ({probe:'预扫描',main:'正式测速',done:'完成'})[p] || '等待';
+  return ({probe:'延迟 / 丢包初筛',region:'地区筛选',speed:'速度决赛',done:'严选完成'})[p] || '等待';
 }
 function progressText(st={}) {
   const p = st.progress || {};
@@ -146,10 +187,10 @@ function fmtNum(v, digits=1) {
   return Number.isFinite(n) ? n.toFixed(digits) : '0';
 }
 function fmtLoss(v) { return `${Math.round(Number(v || 0) * 100)}%`; }
-function observedStatus(r={}) {
-  if (r.qualified) return ['达标','ok'];
-  const reason = String(r.reject_reason || '');
-  if (reason.includes('等待')) return ['待确认','waiting'];
+function observedStatus(r={}, selected=false, running=false) {
+  if (r.qualified && selected) return [running ? '暂列入选' : '入选','selected'];
+  if (r.qualified) return ['合格','ok'];
+  if (!r.speed_tested) return ['待测速','waiting'];
   return ['未达标','bad'];
 }
 
@@ -199,8 +240,8 @@ function renderTasks() {
           <span class="line-result">${esc(progressText(st))}</span>
         </div>
         ${st.running ? `<div class="progress-track"><i style="width:${Math.max(2,Math.min(100,Number(pg.percent || 0)))}%"></i></div>
-          <div class="progress-mini"><span>已扫 ${pg.current || 0}${pg.total ? ` / ${pg.total}` : ''}</span><span>可用 ${pg.available || 0}</span><span>点此看详情</span></div>` :
-          (st.observed_total ? `<div class="progress-mini"><span>观察到 ${st.observed_total} 个</span><span>达标 ${st.results?.length || 0}</span><span>点此看详情</span></div>` : '')}
+          <div class="progress-mini"><span>${esc(phaseLabel(st))} ${pg.current || 0}${pg.total ? ` / ${pg.total}` : ''}</span><span>合格 ${st.funnel?.speed_passed || 0}</span><span>点此看详情</span></div>` :
+          (st.observed_total ? `<div class="progress-mini"><span>决赛 ${st.funnel?.region_passed || st.observed_total} 个</span><span>速度合格 ${st.funnel?.speed_passed || st.results?.length || 0}</span><span>点此看详情</span></div>` : '')}
       </div>`;
     }).join('') || `<div class="line-row"><span class="line-meta">尚未配置 IP 线路</span></div>`;
 
@@ -209,8 +250,8 @@ function renderTasks() {
     d.innerHTML = `
       <div class="task-top">
         <div>
-          <div class="task-domain">${esc(t.hostname)}</div>
-          <div class="task-name">${esc(t.name || '未命名任务')}</div>
+          <div class="task-domain">${esc(taskHostname(t))}</div>
+          <div class="task-name">${t.name ? `备注 · ${esc(t.name)}` : esc(providerById(t.provider_id)?.name || '')}</div>
         </div>
         <div class="status-dot ${stateClass}">${stateText}</div>
       </div>
@@ -250,38 +291,60 @@ function renderScanDetail() {
   const src = sourceById(scanDetailSourceId);
   const st = runtime.sources?.[scanDetailSourceId] || {};
   const pg = st.progress || {};
-  const rows = st.observed || [];
+  const f = st.funnel || {};
+  const need = requiredCountForSource(scanDetailSourceId);
   const logs = st.logs || [];
   const pct = Number(pg.percent || (st.running ? 0 : st.results?.length ? 100 : 0));
 
+  // Engine already sorts live results, but sort again defensively:
+  // qualified by speed desc -> pending -> speed failures by speed desc.
+  const rows = [...(st.observed || [])].sort((a,b) => {
+    const group = r => r.qualified ? 0 : (!r.speed_tested ? 1 : 2);
+    const ga=group(a), gb=group(b);
+    if (ga !== gb) return ga-gb;
+    if ((ga===0 || ga===2) && Number(a.speed_mb||0)!==Number(b.speed_mb||0)) return Number(b.speed_mb||0)-Number(a.speed_mb||0);
+    return Number(a.latency_ms||999999)-Number(b.latency_ms||999999);
+  });
+
+  let qualifiedIndex = 0;
   const resultRows = rows.length ? rows.slice(0,500).map(r => {
-    const [label, cls] = observedStatus(r);
-    return `<div class="scan-result-row">
+    let selected = false;
+    if (r.qualified) {
+      selected = qualifiedIndex < need;
+      qualifiedIndex++;
+    }
+    const [label, cls] = observedStatus(r, selected, !!st.running);
+    return `<div class="scan-result-row ${r.qualified?'is-qualified':''} ${selected?'is-selected':''}">
       <div class="scan-ip">${esc(r.ip || '')}<span class="scan-badge ${cls}">${label}</span></div>
       <div class="scan-metrics">
         <span>${r.latency_ms ? `${fmtNum(r.latency_ms)} ms` : '— ms'}</span>
         <span>丢包 ${fmtLoss(r.loss)}</span>
-        <span>${r.speed_mb ? `${fmtNum(r.speed_mb,2)} MB/s` : '未测速'}</span>
+        <span>${r.speed_tested ? `${fmtNum(r.speed_mb,2)} MB/s` : '待测速'}</span>
         <span>${esc(r.colo || '—')}</span>
       </div>
       ${r.reject_reason ? `<div class="scan-reason">${esc(r.reject_reason)}</div>` : ''}
     </div>`;
-  }).join('') : `<div class="empty mini"><b>还没有 IP 明细</b>${st.running ? '正在预扫描，结果出现后会自动刷新。' : '点击“立即优选”开始扫描。'}</div>`;
+  }).join('') : `<div class="empty mini"><b>还没有决赛 IP</b>${st.running ? '正在做延迟、丢包和地区初筛；淘汰项不会铺满列表，进入速度决赛后会实时显示。' : '点击“立即优选”开始严选。'}</div>`;
 
   body.innerHTML = `
     <div class="scan-live-card">
       <div class="scan-live-head"><div><div class="mini-label">当前阶段</div><b>${esc(phaseLabel(st))}</b></div><span class="scan-live-state ${st.running?'running':st.error?'bad':'ok'}">${st.running?'运行中':st.error?'失败':'完成'}</span></div>
       <div class="progress-track large"><i style="width:${Math.max(0,Math.min(100,pct))}%"></i></div>
-      <div class="scan-stats">
-        <div><b>${pg.current || 0}${pg.total ? `/${pg.total}` : ''}</b><span>已扫描</span></div>
-        <div><b>${pg.available || 0}</b><span>可连通</span></div>
-        <div><b>${st.observed_total || rows.length || 0}</b><span>观察结果</span></div>
-        <div><b>${st.results?.length || 0}</b><span>最终达标</span></div>
+      <div class="funnel-grid">
+        <div><b>${f.total_candidates || pg.total || 0}</b><span>总候选</span></div>
+        <div><b>${f.responsive || 0}</b><span>可连通</span></div>
+        <div><b>${f.latency_passed || 0}</b><span>延迟通过</span></div>
+        <div><b>${f.loss_passed || 0}</b><span>丢包通过</span></div>
+        <div><b>${f.region_passed || 0}</b><span>地区通过 / 决赛</span></div>
+        <div><b>${f.speed_tested || 0}/${f.region_passed || 0}</b><span>速度已测</span></div>
+        <div><b>${f.speed_passed || 0}</b><span>速度合格</span></div>
+        <div><b>${Math.min(need, Number(f.speed_passed || 0))}/${need}</b><span>${st.running?'暂列入选':'最终入选'}</span></div>
       </div>
+      <div class="strict-note">严选流程：全量延迟/丢包 → 地区筛选 → 所有幸存 IP 进入速度决赛。延迟、丢包或地区不合格的 IP 直接淘汰，不占用下面列表；速度不达标会保留显示。最终按速度从高到低排序。</div>
       ${st.error ? `<div class="scan-error">${esc(compactError(st.error))}</div>` : ''}
     </div>
 
-    <div class="scan-section-head"><b>IP 扫描明细</b><span>显示最多 500 条 · 包含未达标</span></div>
+    <div class="scan-section-head"><b>速度决赛明细</b><span>合格实时置顶 · 按速度降序 · 目标 ${need} 个</span></div>
     <div class="scan-results">${resultRows}</div>
 
     <details class="scan-log-box" open>
@@ -330,7 +393,7 @@ function renderProviders() {
     const d = document.createElement('div');
     d.className = 'provider-card';
     d.innerHTML = `<div class="provider-head">
-      <div><b>${esc(p.name || 'Cloudflare')}</b><div class="provider-meta">Cloudflare · ${used} 个任务 · Zone ${esc(mask(p.zone_id))}</div></div>
+      <div><b>${esc(p.name || 'Cloudflare')}</b><div class="provider-meta">${esc(normalizeZoneDomain(p.zone_domain) || '未设置主域名')} · ${providerAuthMode(p)==='global_api_key'?'Email + Global API Key':'API Token'} · ${used} 个任务</div></div>
       <div class="provider-actions"><button data-edit>编辑</button><button data-del>删除</button></div>
     </div>`;
     d.querySelector('[data-edit]').onclick = () => openProviderEditor(p.id);
@@ -476,8 +539,9 @@ function openTaskEditor(targetId='') {
   const existing = targetId ? cfg.targets.find(t => t.id === targetId) : null;
   const t = existing ? clone(existing) : {
     id:uid('task'), name:'', enabled:true,
-    provider_id:cfg.providers[0].id, hostname:'', ttl:60, proxied:false, sources:[]
+    provider_id:cfg.providers[0].id, prefix:'', hostname:'', ttl:60, proxied:false, sources:[]
   };
+  t.prefix = taskPrefixValue(t, providerById(t.provider_id));
   const drafts = existing ? taskLines(existing).map(x => ({
     originalSourceId:x.source.id,
     ref:clone(x.ref),
@@ -489,11 +553,12 @@ function openTaskEditor(targetId='') {
   root.innerHTML = `<div class="overlay" id="taskOverlay"><div class="sheet">
     <div class="sheet-head"><h3>${existing ? '编辑域名任务' : '新建域名任务'}</h3><button class="sheet-close" data-close>×</button></div>
     <div class="sheet-body">
-      <label class="field"><span>域名</span><input id="taskHost" value="${esc(t.hostname)}" placeholder="例如 v4.629717.xyz" autocomplete="off"></label>
       <div class="grid2">
-        <label class="field"><span>任务名称（可选）</span><input id="taskName" value="${esc(t.name)}" placeholder="例如 日本优选"></label>
         <label class="field"><span>DNS 账号</span><select id="taskProvider">${providerOptions(t.provider_id)}</select></label>
+        <label class="field"><span>域名前缀</span><input id="taskPrefix" value="${esc(t.prefix || '')}" placeholder="例如 v4 / nrtv4 / @" autocomplete="off"></label>
       </div>
+      <div id="taskDomainPreview" class="domain-preview"></div>
+      <label class="field"><span>备注（可选）</span><input id="taskName" value="${esc(t.name || '')}" placeholder="例如 日本 NRT 严选、移动线路"></label>
       <div class="toggle-line"><div><b style="font-size:13px">启用任务</b><div class="help">关闭后不会定时优选</div></div><input id="taskEnabled" class="switch" type="checkbox" ${t.enabled?'checked':''}></div>
       <div class="mini-label" style="margin-top:10px">IP 线路</div>
       <div class="modal-note">一条线路就是一组独立的 IP 段和筛选规则。一个域名可以同时添加 IPv4、IPv6、NRT IPv4 等任意组合。</div>
@@ -572,23 +637,40 @@ function openTaskEditor(targetId='') {
     drafts.push(newLineDraft(usedFamilies.includes('ipv4') && !usedFamilies.includes('ipv6') ? 'ipv6' : 'ipv4'));
     drawLines();
   };
+  const updateTaskDomainPreview = () => {
+    const provider = providerById($('#taskProvider').value);
+    const prefix = $('#taskPrefix').value.trim().toLowerCase();
+    const hostname = composeHostname(provider, prefix);
+    const domain = normalizeZoneDomain(provider?.zone_domain || '');
+    $('#taskDomainPreview').innerHTML = hostname
+      ? `<b>最终域名</b><span>${esc(hostname)}</span>`
+      : `<b>最终域名</b><span>${domain ? '请输入前缀；根域名请填 @' : '请先在 DNS 账号中设置主域名'}</span>`;
+  };
+  $('#taskProvider').onchange = updateTaskDomainPreview;
+  $('#taskPrefix').oninput = updateTaskDomainPreview;
+  updateTaskDomainPreview();
+
   root.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
   $('#taskOverlay').onclick = e => { if (e.target.id === 'taskOverlay') closeModal(); };
   $('#saveTaskBtn').onclick = async () => {
-    t.hostname = $('#taskHost').value.trim().toLowerCase();
-    t.name = $('#taskName').value.trim() || t.hostname;
     t.provider_id = $('#taskProvider').value;
+    const provider = providerById(t.provider_id);
+    t.prefix = $('#taskPrefix').value.trim().toLowerCase();
+    t.hostname = composeHostname(provider, t.prefix);
+    t.name = $('#taskName').value.trim();
     t.enabled = $('#taskEnabled').checked;
     t.ttl = Math.max(1, Number($('#taskTTL').value) || 60);
     t.proxied = $('#taskProxied').value === 'true';
-    if (!t.hostname) return toast('请填写域名', true);
     if (!t.provider_id) return toast('请选择 DNS 账号', true);
+    if (!normalizeZoneDomain(provider?.zone_domain || '')) return toast('这个 DNS 账号还没有设置主域名 / Zone', true);
+    if (!t.prefix) return toast('请填写域名前缀；根域名请填 @', true);
+    if (!t.hostname) return toast('无法生成最终域名', true);
     if (!drafts.length) return toast('至少保留一条 IP 线路', true);
     if (drafts.some(d => !(d.source.inputs || []).length)) return toast('每条线路至少填写一个 IP 段或 IP 源', true);
     if (await persistTask(t, drafts, existing)) closeModal();
   };
   if (existing) $('#deleteTaskBtn').onclick = async () => {
-    if (!confirm(`删除 ${existing.hostname}？\n同时会删除仅属于这个任务的 IP 线路。`)) return;
+    if (!confirm(`删除 ${taskHostname(existing)}？\n同时会删除仅属于这个任务的 IP 线路。`)) return;
     deleteTask(existing.id);
     if (await saveConfig('任务已删除')) closeModal();
   };
@@ -663,25 +745,100 @@ function splitComma(v) { return String(v || '').split(',').map(x => x.trim()).fi
 
 function openProviderEditor(providerId='') {
   const existing = providerId ? cfg.providers.find(p => p.id === providerId) : null;
-  const p = existing ? clone(existing) : {id:uid('cf'),name:'Cloudflare',type:'cloudflare',zone_id:'',api_token:''};
+  const p = existing ? clone(existing) : {
+    id:uid('cf'), name:'Cloudflare', type:'cloudflare',
+    zone_id:'', zone_domain:'', auth_mode:'api_token',
+    api_token:'', email:'', api_key:''
+  };
+  p.auth_mode = providerAuthMode(p);
+
   const root = $('#modalRoot');
   root.innerHTML = `<div class="overlay" id="providerOverlay"><div class="sheet" style="max-width:580px">
     <div class="sheet-head"><h3>${existing?'编辑 DNS 账号':'添加 DNS 账号'}</h3><button class="sheet-close" data-close>×</button></div>
     <div class="sheet-body">
-      <label class="field"><span>名称</span><input id="providerName" value="${esc(p.name)}" placeholder="例如 Cloudflare 主账号"></label>
+      <label class="field"><span>名称</span><input id="providerName" value="${esc(p.name || 'Cloudflare')}" placeholder="例如 Cloudflare 主账号"></label>
+      <label class="field"><span>主域名 / Zone</span><input id="providerDomain" value="${esc(p.zone_domain || '')}" placeholder="例如 629717.xyz" autocomplete="off"></label>
       <label class="field"><span>Zone ID</span><input id="providerZone" value="${esc(p.zone_id || '')}" autocomplete="off"></label>
-      <label class="field"><span>API Token</span><input id="providerToken" type="password" value="${esc(p.api_token || '')}" autocomplete="new-password"></label>
-      <div class="modal-note">建议使用仅具有该 Zone DNS 编辑权限的 API Token。这里的账号配置会保存到 /data/config.json。</div>
+
+      <label class="field"><span>认证方式</span><select id="providerAuthMode">
+        <option value="api_token" ${p.auth_mode==='api_token'?'selected':''}>API Token（推荐，不需要邮箱）</option>
+        <option value="global_api_key" ${p.auth_mode==='global_api_key'?'selected':''}>Email + Global API Key（兼容旧 BestIP）</option>
+      </select></label>
+
+      <div id="providerTokenBox">
+        <label class="field"><span>API Token</span><input id="providerToken" type="password" value="${esc(p.api_token || '')}" autocomplete="new-password" placeholder="Cloudflare API Token"></label>
+        <div class="modal-note">API Token 不需要邮箱。建议权限至少包含该 Zone 的 <b>Zone:Read</b> 与 <b>DNS:Edit</b>。</div>
+      </div>
+
+      <div id="providerGlobalKeyBox">
+        <label class="field"><span>Cloudflare 账号邮箱</span><input id="providerEmail" type="email" value="${esc(p.email || '')}" autocomplete="email" placeholder="your@email.com"></label>
+        <label class="field"><span>Global API Key</span><input id="providerAPIKey" type="password" value="${esc(p.api_key || '')}" autocomplete="new-password" placeholder="Global API Key"></label>
+        <div class="modal-note">这是原 BestIP 的认证方式：请求会使用 <b>X-Auth-Email + X-Auth-Key</b>。</div>
+      </div>
+
+      <div class="modal-note">主域名只在 DNS 账号里配置一次。以后任务只填前缀，例如 <b>v4</b> → <b>v4.${esc(p.zone_domain || '629717.xyz')}</b>；根域名使用 <b>@</b>。</div>
     </div>
-    <div class="sheet-actions"><button data-close>取消</button><button id="saveProviderBtn" class="primary">保存账号</button></div>
+    <div class="sheet-actions provider-sheet-actions">
+      <button data-close>取消</button>
+      <button id="testProviderBtn" class="ghost">测试连接</button>
+      <button id="saveProviderBtn" class="primary">保存账号</button>
+    </div>
   </div></div>`;
+
+  function readProviderForm() {
+    p.name = $('#providerName').value.trim() || 'Cloudflare';
+    p.zone_domain = normalizeZoneDomain($('#providerDomain').value);
+    p.zone_id = $('#providerZone').value.trim();
+    p.auth_mode = $('#providerAuthMode').value;
+    p.api_token = $('#providerToken').value.trim();
+    p.email = $('#providerEmail').value.trim();
+    p.api_key = $('#providerAPIKey').value.trim();
+    return p;
+  }
+  function validateProviderForm() {
+    readProviderForm();
+    if (!p.zone_domain) return '请填写主域名 / Zone，例如 629717.xyz';
+    if (!p.zone_id) return '请填写 Zone ID';
+    if (p.auth_mode === 'global_api_key') {
+      if (!p.email || !p.api_key) return 'Global API Key 模式需要同时填写邮箱和 Global API Key';
+    } else if (!p.api_token) {
+      return 'API Token 模式需要填写 API Token';
+    }
+    return '';
+  }
+  function drawAuthMode() {
+    const legacy = $('#providerAuthMode').value === 'global_api_key';
+    $('#providerTokenBox').style.display = legacy ? 'none' : '';
+    $('#providerGlobalKeyBox').style.display = legacy ? '' : 'none';
+  }
+
+  $('#providerAuthMode').onchange = drawAuthMode;
+  drawAuthMode();
+
   root.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
   $('#providerOverlay').onclick = e => { if (e.target.id === 'providerOverlay') closeModal(); };
+
+  $('#testProviderBtn').onclick = async () => {
+    const err = validateProviderForm();
+    if (err) return toast(err, true);
+    const btn = $('#testProviderBtn');
+    btn.disabled = true;
+    btn.textContent = '测试中…';
+    try {
+      const r = await api('/api/provider/test', {method:'POST', body:JSON.stringify(readProviderForm())});
+      toast(r.message || 'Cloudflare 连接正常');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '测试连接';
+    }
+  };
+
   $('#saveProviderBtn').onclick = async () => {
-    p.name = $('#providerName').value.trim() || 'Cloudflare';
-    p.zone_id = $('#providerZone').value.trim();
-    p.api_token = $('#providerToken').value.trim();
-    if (!p.zone_id || !p.api_token) return toast('Zone ID 和 API Token 都要填写', true);
+    const err = validateProviderForm();
+    if (err) return toast(err, true);
+    readProviderForm();
     const i = cfg.providers.findIndex(x => x.id === p.id);
     if (i >= 0) cfg.providers[i] = p; else cfg.providers.push(p);
     if (await saveConfig(existing ? 'DNS 账号已更新' : 'DNS 账号已添加')) closeModal();

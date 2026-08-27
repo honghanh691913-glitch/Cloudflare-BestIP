@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -19,11 +20,19 @@ type Config struct {
 }
 
 type Provider struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	ZoneID   string `json:"zone_id,omitempty"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	ZoneID     string `json:"zone_id,omitempty"`
+	ZoneDomain string `json:"zone_domain,omitempty"`
+
+	// Cloudflare supports two authentication styles:
+	// 1) API Token (recommended): Authorization: Bearer <token>
+	// 2) Global API Key (legacy BestIP): X-Auth-Email + X-Auth-Key
+	AuthMode string `json:"auth_mode,omitempty"` // api_token | global_api_key
 	APIToken string `json:"api_token,omitempty"`
+	Email    string `json:"email,omitempty"`
+	APIKey   string `json:"api_key,omitempty"`
 }
 
 type Source struct {
@@ -56,10 +65,11 @@ type CFST struct {
 
 type Target struct {
 	ID         string      `json:"id"`
-	Name       string      `json:"name"`
+	Name       string      `json:"name"` // optional note/remark
 	Enabled    bool        `json:"enabled"`
 	ProviderID string      `json:"provider_id"`
-	Hostname   string      `json:"hostname"`
+	Prefix     string      `json:"prefix,omitempty"`   // e.g. v4 / nrtv4 / @
+	Hostname   string      `json:"hostname,omitempty"` // legacy/snapshot FQDN for backward compatibility
 	TTL        int         `json:"ttl"`
 	Proxied    bool        `json:"proxied"`
 	Sources    []TargetRef `json:"sources"`
@@ -135,6 +145,53 @@ func (s *Store) Save(c Config) error {
 	return nil
 }
 
+func normalizeDomain(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	v = strings.TrimPrefix(v, "https://")
+	v = strings.TrimPrefix(v, "http://")
+	v = strings.Trim(v, " ./")
+	if i := strings.IndexByte(v, '/'); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSuffix(v, ".")
+}
+
+func TargetHostname(p Provider, t Target) string {
+	domain := normalizeDomain(p.ZoneDomain)
+	prefix := strings.ToLower(strings.TrimSpace(t.Prefix))
+	prefix = strings.Trim(prefix, " .")
+
+	if domain != "" && prefix != "" {
+		if prefix == "@" {
+			return domain
+		}
+		if prefix == domain || strings.HasSuffix(prefix, "."+domain) {
+			return prefix
+		}
+		return prefix + "." + domain
+	}
+	if domain != "" && strings.TrimSpace(t.Prefix) == "@" {
+		return domain
+	}
+
+	// Old configs stored the full hostname directly.
+	return normalizeDomain(t.Hostname)
+}
+
+func CloudflareAuthMode(p Provider) string {
+	mode := strings.ToLower(strings.TrimSpace(p.AuthMode))
+	switch mode {
+	case "global_api_key", "global", "api_key":
+		return "global_api_key"
+	case "api_token", "token":
+		return "api_token"
+	}
+	if strings.TrimSpace(p.Email) != "" && strings.TrimSpace(p.APIKey) != "" && strings.TrimSpace(p.APIToken) == "" {
+		return "global_api_key"
+	}
+	return "api_token"
+}
+
 func Validate(c Config) error {
 	if c.Listen == "" {
 		return errors.New("listen cannot be empty")
@@ -153,6 +210,7 @@ func Validate(c Config) error {
 		}
 	}
 	providerIDs := map[string]bool{}
+	providers := map[string]Provider{}
 	for _, p := range c.Providers {
 		if p.ID == "" {
 			return errors.New("provider id cannot be empty")
@@ -161,18 +219,38 @@ func Validate(c Config) error {
 			return fmt.Errorf("duplicate provider id: %s", p.ID)
 		}
 		providerIDs[p.ID] = true
+		providers[p.ID] = p
+		if p.Type == "cloudflare" {
+			if strings.TrimSpace(p.ZoneID) == "" {
+				return fmt.Errorf("provider %s: zone_id cannot be empty", p.ID)
+			}
+			switch CloudflareAuthMode(p) {
+			case "global_api_key":
+				if strings.TrimSpace(p.Email) == "" || strings.TrimSpace(p.APIKey) == "" {
+					return fmt.Errorf("provider %s: email and api_key are required for Global API Key auth", p.ID)
+				}
+			default:
+				if strings.TrimSpace(p.APIToken) == "" {
+					return fmt.Errorf("provider %s: api_token is required", p.ID)
+				}
+			}
+		}
 	}
 	targetIDs := map[string]bool{}
 	for _, t := range c.Targets {
-		if t.ID == "" || t.Hostname == "" {
-			return errors.New("target id/hostname cannot be empty")
+		if t.ID == "" {
+			return errors.New("target id cannot be empty")
 		}
 		if targetIDs[t.ID] {
 			return fmt.Errorf("duplicate target id: %s", t.ID)
 		}
 		targetIDs[t.ID] = true
-		if !providerIDs[t.ProviderID] {
+		p, ok := providers[t.ProviderID]
+		if !ok {
 			return fmt.Errorf("target %s references missing provider %s", t.ID, t.ProviderID)
+		}
+		if TargetHostname(p, t) == "" {
+			return fmt.Errorf("target %s: prefix/hostname cannot be empty", t.ID)
 		}
 		for _, r := range t.Sources {
 			if !sourceIDs[r.SourceID] {

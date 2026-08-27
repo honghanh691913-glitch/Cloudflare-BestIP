@@ -50,6 +50,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/version", a.versionHandler)
 	mux.HandleFunc("/api/update/check", a.updateCheckHandler)
 	mux.HandleFunc("/api/update/apply", a.updateApplyHandler)
+	mux.HandleFunc("/api/provider/test", a.providerTestHandler)
 	mux.HandleFunc("/api/run/source", a.runSourceHandler)
 	mux.HandleFunc("/api/run/all", a.runAllHandler)
 	mux.HandleFunc("/api/sync/target", a.syncTargetHandler)
@@ -197,6 +198,25 @@ func (a *App) updateApplyHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) providerTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(405)
+		return
+	}
+	var p config.Provider
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := a.dns.TestProvider(ctx, p); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "message": "Cloudflare 认证和 Zone 访问正常"})
+}
+
 func (a *App) runSourceHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(405)
@@ -272,7 +292,7 @@ func (a *App) runAndPublish(s config.Source) {
 		for _, ref := range t.Sources {
 			if ref.SourceID == s.ID {
 				if err := a.syncTarget(context.Background(), t.ID); err != nil {
-					log.Printf("[dns] target=%s host=%s sync failed: %v", t.ID, t.Hostname, err)
+					log.Printf("[dns] target=%s sync failed: %v", t.ID, err)
 				}
 				break
 			}
@@ -292,7 +312,6 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	if t == nil {
 		return fmt.Errorf("target not found")
 	}
-	log.Printf("[dns] sync start target=%s host=%s", t.ID, t.Hostname)
 	var p *config.Provider
 	for i := range c.Providers {
 		if c.Providers[i].ID == t.ProviderID {
@@ -303,6 +322,8 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	if p == nil {
 		return fmt.Errorf("provider not found")
 	}
+	hostname := config.TargetHostname(*p, *t)
+	log.Printf("[dns] sync start target=%s host=%s auth=%s", t.ID, hostname, config.CloudflareAuthMode(*p))
 	latest := map[string][]engine.Result{}
 	for _, ref := range t.Sources {
 		latest[ref.SourceID] = a.Engine.Latest(ref.SourceID)
@@ -312,9 +333,9 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	}
 	err := a.dns.SyncTarget(ctx, *p, *t, latest)
 	if err != nil {
-		log.Printf("[dns] sync failed target=%s host=%s: %v", t.ID, t.Hostname, err)
+		log.Printf("[dns] sync failed target=%s host=%s: %v", t.ID, hostname, err)
 	} else {
-		log.Printf("[dns] sync success target=%s host=%s", t.ID, t.Hostname)
+		log.Printf("[dns] sync success target=%s host=%s", t.ID, hostname)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()

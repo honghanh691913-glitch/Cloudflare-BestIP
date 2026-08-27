@@ -3,16 +3,19 @@ package engine
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +31,7 @@ type Result struct {
 	LatencyMS    float64   `json:"latency_ms,omitempty"`
 	Loss         float64   `json:"loss,omitempty"`
 	SpeedMB      float64   `json:"speed_mb,omitempty"`
+	SpeedTested  bool      `json:"speed_tested"`
 	Qualified    bool      `json:"qualified"`
 	RejectReason string    `json:"reject_reason,omitempty"`
 	TestedAt     time.Time `json:"tested_at"`
@@ -41,6 +45,16 @@ type ScanProgress struct {
 	Percent   int    `json:"percent"`
 }
 
+type FunnelStats struct {
+	TotalCandidates int `json:"total_candidates"`
+	Responsive      int `json:"responsive"`
+	LatencyPassed   int `json:"latency_passed"`
+	LossPassed      int `json:"loss_passed"`
+	RegionPassed    int `json:"region_passed"`
+	SpeedTested     int `json:"speed_tested"`
+	SpeedPassed     int `json:"speed_passed"`
+}
+
 type SourceStatus struct {
 	SourceID      string       `json:"source_id"`
 	Running       bool         `json:"running"`
@@ -52,6 +66,7 @@ type SourceStatus struct {
 	InputItems    int          `json:"input_items"`
 	ObservedTotal int          `json:"observed_total"`
 	Progress      ScanProgress `json:"progress"`
+	Funnel        FunnelStats  `json:"funnel"`
 	Results       []Result     `json:"results"`
 	Observed      []Result     `json:"observed"`
 	Logs          []string     `json:"logs"`
@@ -103,14 +118,15 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	m.setStatus(SourceStatus{
 		SourceID:   s.ID,
 		Running:    true,
-		Stage:      "准备扫描",
+		Stage:      "准备严选",
 		StartedAt:  started,
 		LastUpdate: started,
-		Results:    append([]Result(nil), prev.Results...),
-		Observed:   []Result{},
-		Logs:       []string{},
+		// DNS keeps using the previous complete result set until this run finishes.
+		Results:  append([]Result(nil), prev.Results...),
+		Observed: []Result{},
+		Logs:     []string{},
 	})
-	m.logf(s.ID, "START name=%q family=%s inputs=%d all_ip=%v colo=%s thresholds(latency<=%.0fms loss<=%.2f speed>=%.2fMB/s)",
+	m.logf(s.ID, "STRICT START name=%q family=%s inputs=%d all_ip=%v colo=%s thresholds(latency<=%.0fms loss<=%.2f speed>=%.2fMB/s)",
 		s.Name, s.Family, len(s.Inputs), s.CFST.AllIP, strings.Join(s.CFST.Colo, ","),
 		s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB)
 
@@ -134,96 +150,467 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 		bin = "cfst"
 	}
 
-	// Lightweight pre-scan: collect responsive IPs with relaxed delay/loss filters.
-	// This makes the Web UI useful even if the final speed/region filter returns 0.
+	// Round 1: fast, highly parallel latency/loss scan of the whole candidate set.
+	// Download is disabled, so even an IPv4 /24 can be screened in a few seconds.
 	probeFile := filepath.Join(workdir, "probe.csv")
-	mainInputFile := inputFile
-	m.patchStage(s.ID, "连通性预扫描")
+	m.patchStage(s.ID, "延迟 / 丢包初筛")
 	probeArgs := buildProbeArgs(s, inputFile, probeFile)
 	if err := m.runCFST(ctx, s.ID, "probe", bin, probeArgs, workdir); err != nil {
-		m.logf(s.ID, "WARN pre-scan failed: %v; continuing with main scan", err)
-	} else if _, statErr := os.Stat(probeFile); statErr == nil {
-		if observed, parseErr := parseCSV(probeFile, s.Family); parseErr == nil {
-			observed = annotatePreScan(observed, s)
-			m.setObserved(s.ID, observed)
-			if len(observed) > 0 {
-				exactInput := filepath.Join(workdir, "responsive-ips.txt")
-				if writeResultIPs(exactInput, observed) == nil {
-					mainInputFile = exactInput
-				}
-			}
-			m.logf(s.ID, "PROBE done responsive=%d; main scan will reuse the same responsive IP set", len(observed))
-		} else {
-			m.logf(s.ID, "WARN unable to parse pre-scan CSV: %v", parseErr)
-		}
-	} else {
-		m.logf(s.ID, "PROBE done responsive=0 (CFST created no CSV)")
-	}
-
-	outFile := filepath.Join(workdir, "result.csv")
-	m.patchStage(s.ID, "正式测速")
-	args := buildArgs(s, mainInputFile, outFile)
-	if err := m.runCFST(ctx, s.ID, "main", bin, args, workdir); err != nil {
 		return m.fail(s.ID, err)
 	}
-
-	m.patchStage(s.ID, "解析结果")
-	if _, statErr := os.Stat(outFile); statErr != nil {
+	if _, statErr := os.Stat(probeFile); statErr != nil {
 		if os.IsNotExist(statErr) {
-			m.finalizeObserved(s.ID, nil, s)
-			return m.fail(s.ID, fmt.Errorf(
-				"本次正式测速完成，但 0 个 IP 进入最终结果；扫描详情里仍可查看预扫描 IP、延迟和丢包",
-			))
+			return m.fail(s.ID, fmt.Errorf("初筛完成，但没有任何可连通 IP"))
 		}
 		return m.fail(s.ID, statErr)
 	}
-
-	rawResults, err := parseCSV(outFile, s.Family)
+	probeRows, err := parseCSV(probeFile, s.Family)
 	if err != nil {
 		return m.fail(s.ID, err)
 	}
-	for i := range rawResults {
-		rawResults[i].Qualified = true
-		rawResults[i].RejectReason = ""
+
+	st := m.currentStatus(s.ID)
+	total := st.Progress.Total
+	if total < len(probeRows) {
+		total = len(probeRows)
+	}
+	funnel := FunnelStats{TotalCandidates: total, Responsive: len(probeRows)}
+
+	latencyRows := make([]Result, 0, len(probeRows))
+	for _, r := range probeRows {
+		if s.CFST.LatencyMaxMS > 0 && r.LatencyMS > s.CFST.LatencyMaxMS {
+			continue
+		}
+		if s.CFST.LatencyMinMS > 0 && r.LatencyMS < s.CFST.LatencyMinMS {
+			continue
+		}
+		latencyRows = append(latencyRows, r)
+	}
+	funnel.LatencyPassed = len(latencyRows)
+
+	lossRows := make([]Result, 0, len(latencyRows))
+	for _, r := range latencyRows {
+		if s.CFST.LossMax >= 0 && r.Loss > s.CFST.LossMax {
+			continue
+		}
+		lossRows = append(lossRows, r)
+	}
+	funnel.LossPassed = len(lossRows)
+	m.patchFunnel(s.ID, funnel)
+	m.logf(s.ID, "FUNNEL initial total=%d responsive=%d latency_pass=%d loss_pass=%d",
+		funnel.TotalCandidates, funnel.Responsive, funnel.LatencyPassed, funnel.LossPassed)
+
+	if len(lossRows) == 0 {
+		return m.fail(s.ID, fmt.Errorf("全部 IP 已在延迟/丢包初筛中淘汰"))
 	}
 
-	finalResults := rawResults
+	// Round 2: lightweight Colo lookup only for the latency/loss survivors.
+	// This follows the same efficient idea as CFData-WEB: trace/Colo is resolved
+	// before expensive bandwidth testing.
+	finalists := lossRows
 	if len(s.CFST.Colo) > 0 {
-		finalResults = filterResultsByColo(rawResults, s.CFST.Colo)
+		m.patchStage(s.ID, "地区筛选")
+		finalists = m.filterByRegion(ctx, s.ID, s, lossRows)
 	}
-	for i := range finalResults {
-		finalResults[i].Qualified = true
-		finalResults[i].RejectReason = ""
+	funnel = m.currentStatus(s.ID).Funnel
+	if len(s.CFST.Colo) == 0 {
+		funnel.RegionPassed = len(finalists)
+		m.patchFunnel(s.ID, funnel)
+	}
+	if len(finalists) == 0 {
+		return m.fail(s.ID, fmt.Errorf("延迟/丢包已通过，但没有 IP 匹配地区 %s", strings.Join(s.CFST.Colo, ",")))
 	}
 
-	m.finalizeObserved(s.ID, rawResults, s)
+	for i := range finalists {
+		finalists[i].Qualified = false
+		finalists[i].SpeedTested = false
+		finalists[i].RejectReason = "待速度决赛"
+	}
+	sort.SliceStable(finalists, func(i, j int) bool { return finalists[i].LatencyMS < finalists[j].LatencyMS })
+	m.setObserved(s.ID, finalists)
+	m.logf(s.ID, "FINALS ready=%d; all finalists will be speed-tested for strict ranking", len(finalists))
 
-	if len(finalResults) == 0 {
-		return m.fail(s.ID, fmt.Errorf(
-			"测速已有速度结果，但没有结果匹配地区 %s；请在扫描详情查看各 IP 实际 Colo",
-			strings.Join(s.CFST.Colo, ","),
-		))
+	// Round 3: speed final. Every surviving IP is tested. Results appear live:
+	// qualified rows are pinned to the top and sorted by measured speed.
+	m.patchStage(s.ID, "速度决赛")
+	for i := range finalists {
+		if err := ctx.Err(); err != nil {
+			return m.fail(s.ID, err)
+		}
+		speed, err := measureDownloadSpeed(ctx, s, finalists[i].IP)
+		finalists[i].SpeedTested = true
+		finalists[i].TestedAt = time.Now()
+
+		if err != nil {
+			finalists[i].Qualified = false
+			finalists[i].RejectReason = "测速失败：" + compactReason(err.Error())
+			m.logf(s.ID, "SPEED %d/%d ip=%s failed=%v", i+1, len(finalists), finalists[i].IP, err)
+		} else {
+			finalists[i].SpeedMB = speed
+			if s.CFST.SpeedMinMB > 0 && speed < s.CFST.SpeedMinMB {
+				finalists[i].Qualified = false
+				finalists[i].RejectReason = fmt.Sprintf("速度 %.2f MB/s < %.2f MB/s", speed, s.CFST.SpeedMinMB)
+				m.logf(s.ID, "SPEED %d/%d ip=%s speed=%.2fMB/s NOT_QUALIFIED", i+1, len(finalists), finalists[i].IP, speed)
+			} else {
+				finalists[i].Qualified = true
+				finalists[i].RejectReason = ""
+				m.logf(s.ID, "SPEED %d/%d ip=%s speed=%.2fMB/s QUALIFIED", i+1, len(finalists), finalists[i].IP, speed)
+			}
+		}
+
+		funnel := m.currentStatus(s.ID).Funnel
+		funnel.SpeedTested = i + 1
+		funnel.SpeedPassed = countQualified(finalists)
+		m.patchFunnel(s.ID, funnel)
+		m.patchProgress(s.ID, ScanProgress{
+			Phase:     "speed",
+			Current:   i + 1,
+			Total:     len(finalists),
+			Available: funnel.SpeedPassed,
+		})
+		m.setObserved(s.ID, sortObservedForDisplay(finalists))
+	}
+
+	qualified := make([]Result, 0, len(finalists))
+	for _, r := range finalists {
+		if r.Qualified {
+			qualified = append(qualified, r)
+		}
+	}
+	sort.SliceStable(qualified, func(i, j int) bool {
+		if qualified[i].SpeedMB == qualified[j].SpeedMB {
+			return qualified[i].LatencyMS < qualified[j].LatencyMS
+		}
+		return qualified[i].SpeedMB > qualified[j].SpeedMB
+	})
+
+	if len(qualified) == 0 {
+		return m.fail(s.ID, fmt.Errorf("速度决赛完成，但没有 IP 达到 %.2f MB/s 的速度及格线", s.CFST.SpeedMinMB))
 	}
 
 	keep := s.KeepResults
 	if keep <= 0 {
 		keep = 50
 	}
-	if len(finalResults) > keep {
-		finalResults = finalResults[:keep]
+	if len(qualified) > keep {
+		qualified = qualified[:keep]
 	}
 
-	st := m.currentStatus(s.ID)
+	st = m.currentStatus(s.ID)
 	st.Running = false
-	st.Stage = "完成"
+	st.Stage = "严选完成"
 	st.Error = ""
 	st.EndedAt = time.Now()
 	st.LastUpdate = time.Now()
-	st.Results = finalResults
-	st.Progress = ScanProgress{Phase: "done", Current: len(finalResults), Total: len(finalResults), Available: len(finalResults), Percent: 100}
+	st.Results = append([]Result(nil), qualified...)
+	st.Observed = sortObservedForDisplay(finalists)
+	st.ObservedTotal = len(finalists)
+	st.Progress = ScanProgress{
+		Phase:     "done",
+		Current:   len(finalists),
+		Total:     len(finalists),
+		Available: len(qualified),
+		Percent:   100,
+	}
+	st.Funnel.SpeedTested = len(finalists)
+	st.Funnel.SpeedPassed = len(qualified)
 	m.setStatus(st)
-	m.logf(s.ID, "DONE qualified=%d observed=%d elapsed=%s", len(finalResults), st.ObservedTotal, time.Since(started).Round(time.Millisecond))
+	m.logf(s.ID, "STRICT DONE finalists=%d qualified=%d best=%s %.2fMB/s elapsed=%s",
+		len(finalists), len(qualified), qualified[0].IP, qualified[0].SpeedMB, time.Since(started).Round(time.Millisecond))
 	return nil
+}
+
+func countQualified(rows []Result) int {
+	n := 0
+	for _, r := range rows {
+		if r.SpeedTested && r.Qualified {
+			n++
+		}
+	}
+	return n
+}
+
+func sortObservedForDisplay(rows []Result) []Result {
+	out := append([]Result(nil), rows...)
+	rank := func(r Result) int {
+		switch {
+		case r.SpeedTested && r.Qualified:
+			return 0
+		case !r.SpeedTested:
+			return 1
+		default:
+			return 2
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := rank(out[i]), rank(out[j])
+		if ri != rj {
+			return ri < rj
+		}
+		if ri == 0 || ri == 2 {
+			if out[i].SpeedMB != out[j].SpeedMB {
+				return out[i].SpeedMB > out[j].SpeedMB
+			}
+		}
+		return out[i].LatencyMS < out[j].LatencyMS
+	})
+	return out
+}
+
+func compactReason(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if len([]rune(s)) > 120 {
+		r := []rune(s)
+		return string(r[:120]) + "…"
+	}
+	return s
+}
+
+func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.Source, rows []Result) []Result {
+	wanted := map[string]bool{}
+	for _, c := range s.CFST.Colo {
+		c = strings.ToUpper(strings.TrimSpace(c))
+		if c != "" {
+			wanted[c] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return rows
+	}
+
+	type item struct {
+		idx int
+		row Result
+	}
+	jobs := make(chan item)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	passed := make([]Result, 0, len(rows))
+	done := 0
+
+	workers := 64
+	if len(rows) < workers {
+		workers = len(rows)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				r := job.row
+				colo, err := fetchColo(ctx, s, r.IP)
+				r.Colo = colo
+
+				mu.Lock()
+				done++
+				if err == nil && wanted[strings.ToUpper(strings.TrimSpace(colo))] {
+					r.RejectReason = "待速度决赛"
+					passed = append(passed, r)
+				}
+				currentDone := done
+				currentPassed := len(passed)
+				snapshot := append([]Result(nil), passed...)
+				mu.Unlock()
+
+				m.patchProgress(sourceID, ScanProgress{
+					Phase:     "region",
+					Current:   currentDone,
+					Total:     len(rows),
+					Available: currentPassed,
+				})
+				if currentDone%20 == 0 || currentDone == len(rows) {
+					m.logf(sourceID, "REGION progress %d/%d matched=%d", currentDone, len(rows), currentPassed)
+				}
+				if currentDone%10 == 0 || currentDone == len(rows) {
+					sort.SliceStable(snapshot, func(i, j int) bool { return snapshot[i].LatencyMS < snapshot[j].LatencyMS })
+					m.setObserved(sourceID, snapshot)
+				}
+			}
+		}()
+	}
+	for i, r := range rows {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return nil
+		case jobs <- item{idx: i, row: r}:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	sort.SliceStable(passed, func(i, j int) bool { return passed[i].LatencyMS < passed[j].LatencyMS })
+	funnel := m.currentStatus(sourceID).Funnel
+	funnel.RegionPassed = len(passed)
+	m.patchFunnel(sourceID, funnel)
+	m.setObserved(sourceID, passed)
+	m.logf(sourceID, "REGION done matched=%d/%d wanted=%s", len(passed), len(rows), strings.Join(s.CFST.Colo, ","))
+	return passed
+}
+
+func fetchColo(ctx context.Context, s config.Source, ip string) (string, error) {
+	raw := strings.TrimSpace(s.CFST.URL)
+	if raw == "" {
+		raw = "https://speed.cloudflare.com/__down?bytes=1000000"
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("invalid speed URL")
+	}
+	host := u.Hostname()
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		scheme = "https"
+	}
+	port := s.CFST.Port
+	if port <= 0 {
+		if p := u.Port(); p != "" {
+			port, _ = strconv.Atoi(p)
+		}
+	}
+	if port <= 0 {
+		if scheme == "https" {
+			port = 443
+		} else {
+			port = 80
+		}
+	}
+
+	traceURL := fmt.Sprintf("%s://%s/cdn-cgi/trace", scheme, u.Host)
+	client := boundHTTPClient(ip, port, host, 2500*time.Millisecond)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, traceURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		// A custom speed host may have unusual routing. Fall back to the canonical
+		// Cloudflare trace host while keeping the same edge IP.
+		fallback := "https://speed.cloudflare.com/cdn-cgi/trace"
+		client = boundHTTPClient(ip, 443, "speed.cloudflare.com", 2500*time.Millisecond)
+		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, fallback, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err = client.Do(req)
+		if err != nil {
+			return "", err
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return "", fmt.Errorf("trace HTTP %s", resp.Status)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "colo=") {
+			colo := strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(line, "colo=")))
+			if colo != "" {
+				return colo, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("trace did not return colo")
+}
+
+func measureDownloadSpeed(ctx context.Context, s config.Source, ip string) (float64, error) {
+	raw := strings.TrimSpace(s.CFST.URL)
+	if raw == "" {
+		raw = "https://speed.cloudflare.com/__down?bytes=100000000"
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return 0, fmt.Errorf("invalid speed URL %q", raw)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return 0, fmt.Errorf("speed URL must use http/https")
+	}
+	port := s.CFST.Port
+	if port <= 0 {
+		if p := u.Port(); p != "" {
+			port, _ = strconv.Atoi(p)
+		}
+	}
+	if port <= 0 {
+		if scheme == "https" {
+			port = 443
+		} else {
+			port = 80
+		}
+	}
+	seconds := s.CFST.DownloadTime
+	if seconds <= 0 {
+		seconds = 10
+	}
+
+	testCtx, cancel := context.WithTimeout(ctx, time.Duration(seconds+3)*time.Second)
+	defer cancel()
+	client := boundHTTPClient(ip, port, u.Hostname(), time.Duration(seconds+3)*time.Second)
+	req, err := http.NewRequestWithContext(testCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "BestIP-Manager/strict")
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("download HTTP %s", resp.Status)
+	}
+
+	start := time.Now()
+	deadline := start.Add(time.Duration(seconds) * time.Second)
+	buf := make([]byte, 128*1024)
+	var total int64
+	for {
+		if time.Now().After(deadline) {
+			break
+		}
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			total += int64(n)
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			// A timeout after receiving data still yields a meaningful average.
+			if total > 0 {
+				break
+			}
+			return 0, readErr
+		}
+	}
+	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 || total <= 0 {
+		return 0, fmt.Errorf("download returned no data")
+	}
+	return float64(total) / elapsed / 1024 / 1024, nil
+}
+
+func boundHTTPClient(ip string, port int, serverName string, timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 2 * time.Second, KeepAlive: -1}
+	tr := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ip, strconv.Itoa(port)))
+		},
+		DisableKeepAlives: true,
+		TLSClientConfig: &tls.Config{
+			ServerName: serverName,
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+	return &http.Client{Transport: tr, Timeout: timeout}
 }
 
 func (m *Manager) runCFST(ctx context.Context, sourceID, phase, bin string, args []string, workdir string) error {
@@ -363,6 +750,15 @@ func (m *Manager) patchProgress(id string, p ScanProgress) {
 	m.mu.Lock()
 	st := m.status[id]
 	st.Progress = p
+	st.LastUpdate = time.Now()
+	m.status[id] = st
+	m.mu.Unlock()
+}
+
+func (m *Manager) patchFunnel(id string, f FunnelStats) {
+	m.mu.Lock()
+	st := m.status[id]
+	st.Funnel = f
 	st.LastUpdate = time.Now()
 	m.status[id] = st
 	m.mu.Unlock()

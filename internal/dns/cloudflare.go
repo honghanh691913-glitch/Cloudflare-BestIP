@@ -20,6 +20,7 @@ type CloudflareClient struct{ HTTP *http.Client }
 type cfResponse[T any] struct {
 	Success bool `json:"success"`
 	Errors  []struct {
+		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"errors"`
 	Result T `json:"result"`
@@ -35,8 +36,18 @@ func (c CloudflareClient) SyncTarget(ctx context.Context, p config.Provider, t c
 	if p.Type != "cloudflare" {
 		return fmt.Errorf("unsupported provider type: %s", p.Type)
 	}
-	if p.ZoneID == "" || p.APIToken == "" {
-		return fmt.Errorf("provider %s missing zone_id/api_token", p.ID)
+	if strings.TrimSpace(p.ZoneID) == "" {
+		return fmt.Errorf("provider %s missing zone_id", p.ID)
+	}
+	switch config.CloudflareAuthMode(p) {
+	case "global_api_key":
+		if strings.TrimSpace(p.Email) == "" || strings.TrimSpace(p.APIKey) == "" {
+			return fmt.Errorf("provider %s missing email/api_key for Global API Key authentication", p.ID)
+		}
+	default:
+		if strings.TrimSpace(p.APIToken) == "" {
+			return fmt.Errorf("provider %s missing api_token", p.ID)
+		}
 	}
 	desired := map[string][]string{"A": {}, "AAAA": {}}
 	for _, ref := range t.Sources {
@@ -66,13 +77,17 @@ func (c CloudflareClient) SyncTarget(ctx context.Context, p config.Provider, t c
 }
 
 func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t config.Target, typ string, want []string) error {
+	hostname := config.TargetHostname(p, t)
+	if hostname == "" {
+		return fmt.Errorf("target %s has no resolvable hostname", t.ID)
+	}
 	base := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", p.ZoneID)
 	q := url.Values{}
 	q.Set("type", typ)
-	q.Set("name", t.Hostname)
+	q.Set("name", hostname)
 	q.Set("per_page", "100")
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"?"+q.Encode(), nil)
-	req.Header.Set("Authorization", "Bearer "+p.APIToken)
+	applyCloudflareAuth(req, p)
 	resp, err := client(c.HTTP).Do(req)
 	if err != nil {
 		return err
@@ -83,7 +98,7 @@ func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t con
 		return err
 	}
 	if !got.Success {
-		return cfErr(got.Errors)
+		return cloudflareProviderError(p, cfErr(got.Errors))
 	}
 
 	sort.Strings(want)
@@ -109,7 +124,7 @@ func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t con
 	for i := common; i < len(records); i++ {
 		u := base + "/" + records[i].ID
 		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
-		req.Header.Set("Authorization", "Bearer "+p.APIToken)
+		applyCloudflareAuth(req, p)
 		resp, err := client(c.HTTP).Do(req)
 		if err != nil {
 			return err
@@ -117,13 +132,17 @@ func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t con
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("delete %s %s: %s", typ, t.Hostname, resp.Status)
+			return fmt.Errorf("delete %s %s: %s", typ, hostname, resp.Status)
 		}
 	}
 	return nil
 }
 
 func (c CloudflareClient) write(ctx context.Context, p config.Provider, t config.Target, typ, id, ip, method string) error {
+	hostname := config.TargetHostname(p, t)
+	if hostname == "" {
+		return fmt.Errorf("target %s has no resolvable hostname", t.ID)
+	}
 	base := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", p.ZoneID)
 	if id != "" {
 		base += "/" + id
@@ -132,9 +151,9 @@ func (c CloudflareClient) write(ctx context.Context, p config.Provider, t config
 	if ttl == 0 {
 		ttl = 60
 	}
-	body, _ := json.Marshal(map[string]any{"type": typ, "name": t.Hostname, "content": ip, "ttl": ttl, "proxied": t.Proxied})
+	body, _ := json.Marshal(map[string]any{"type": typ, "name": hostname, "content": ip, "ttl": ttl, "proxied": t.Proxied})
 	req, _ := http.NewRequestWithContext(ctx, method, base, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+p.APIToken)
+	applyCloudflareAuth(req, p)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client(c.HTTP).Do(req)
 	if err != nil {
@@ -146,10 +165,58 @@ func (c CloudflareClient) write(ctx context.Context, p config.Provider, t config
 		return err
 	}
 	if !out.Success {
-		return cfErr(out.Errors)
+		return cloudflareProviderError(p, cfErr(out.Errors))
 	}
 	return nil
 }
+func applyCloudflareAuth(req *http.Request, p config.Provider) {
+	if config.CloudflareAuthMode(p) == "global_api_key" {
+		req.Header.Set("X-Auth-Email", strings.TrimSpace(p.Email))
+		req.Header.Set("X-Auth-Key", strings.TrimSpace(p.APIKey))
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(p.APIToken))
+}
+
+func cloudflareProviderError(p config.Provider, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "authentication") || strings.Contains(msg, "10000") || strings.Contains(msg, "9109") {
+		if config.CloudflareAuthMode(p) == "global_api_key" {
+			return fmt.Errorf("Cloudflare 认证失败：当前使用 Email + Global API Key，请检查账号邮箱、Global API Key 与 Zone ID 是否匹配。原错误：%w", err)
+		}
+		return fmt.Errorf("Cloudflare 认证失败：当前使用 API Token（无需邮箱）。请检查 Token 是否有效并至少拥有 Zone:Read 与 DNS:Edit 权限；如果你填写的是 Global API Key，请在 DNS 账号里切换为“Email + Global API Key”。原错误：%w", err)
+	}
+	return err
+}
+
+func (c CloudflareClient) TestProvider(ctx context.Context, p config.Provider) error {
+	if p.Type != "cloudflare" {
+		return fmt.Errorf("unsupported provider type: %s", p.Type)
+	}
+	if strings.TrimSpace(p.ZoneID) == "" {
+		return fmt.Errorf("Zone ID 不能为空")
+	}
+	base := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?per_page=1", p.ZoneID)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base, nil)
+	applyCloudflareAuth(req, p)
+	resp, err := client(c.HTTP).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var got cfResponse[[]cfRecord]
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		return fmt.Errorf("Cloudflare 返回不可解析响应：%w", err)
+	}
+	if !got.Success {
+		return cloudflareProviderError(p, cfErr(got.Errors))
+	}
+	return nil
+}
+
 func client(h *http.Client) *http.Client {
 	if h != nil {
 		return h
@@ -157,11 +224,16 @@ func client(h *http.Client) *http.Client {
 	return http.DefaultClient
 }
 func cfErr(es []struct {
+	Code    int    `json:"code"`
 	Message string `json:"message"`
 }) error {
 	msgs := []string{}
 	for _, e := range es {
-		msgs = append(msgs, e.Message)
+		if e.Code != 0 {
+			msgs = append(msgs, fmt.Sprintf("%d: %s", e.Code, e.Message))
+		} else {
+			msgs = append(msgs, e.Message)
+		}
 	}
 	if len(msgs) == 0 {
 		return fmt.Errorf("cloudflare api error")
