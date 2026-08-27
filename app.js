@@ -9,6 +9,13 @@ const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const clone = v => JSON.parse(JSON.stringify(v));
 const uid = p => `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`;
+const shortErr = value => {
+  const s = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  const m = s.match(/(?:invalid value|flag provided but not defined|invalid argument|parse error|no such file|permission denied)[^。；;\n]*/i);
+  const text = (m ? m[0] : s).trim();
+  return text.length > 180 ? text.slice(0, 180) + '…' : text;
+};
 
 const DEFAULT_CFST = {
   binary:'cfst',
@@ -151,7 +158,7 @@ function renderTasks() {
       </div>
       <div class="chips">${chips.join('')}</div>
       <div class="line-preview">${lineRows}</div>
-      ${err ? `<div class="help" style="color:#ff8f96;margin-top:8px">${esc(err)}</div>` : ''}
+      ${err ? `<div class="help" style="color:#ff8f96;margin-top:8px">${esc(shortErr(err))}</div>` : ''}
       <div class="card-actions">
         <button class="run" data-run>立即优选</button>
         <button class="sync" data-sync>同步 DNS</button>
