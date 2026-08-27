@@ -107,7 +107,11 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = workdir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return m.fail(s.ID, fmt.Errorf("cfst failed: %w: %s", err, tail(string(out), 1800)))
+		msg := summarizeCFSTError(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return m.fail(s.ID, fmt.Errorf("CFST 运行失败：%s", msg))
 	}
 
 	m.patchStage(s.ID, "parsing results")
@@ -180,11 +184,13 @@ func buildArgs(s config.Source, inputFile, outFile string) []string {
 	if c.Port > 0 {
 		args = append(args, "-tp", strconv.Itoa(c.Port))
 	}
+	// CFST v2.3.x defines -tl / -tll as integer flags.
+	// Passing values such as 200.00 makes flag parsing fail with exit status 2.
 	if c.LatencyMaxMS > 0 {
-		args = append(args, "-tl", fmt.Sprintf("%.2f", c.LatencyMaxMS))
+		args = append(args, "-tl", strconv.Itoa(int(c.LatencyMaxMS+0.5)))
 	}
 	if c.LatencyMinMS > 0 {
-		args = append(args, "-tll", fmt.Sprintf("%.2f", c.LatencyMinMS))
+		args = append(args, "-tll", strconv.Itoa(int(c.LatencyMinMS+0.5)))
 	}
 	if c.LossMax > 0 {
 		args = append(args, "-tlr", fmt.Sprintf("%.4f", c.LossMax))
@@ -195,12 +201,16 @@ func buildArgs(s config.Source, inputFile, outFile string) []string {
 	if c.URL != "" {
 		args = append(args, "-url", c.URL)
 	}
-	if c.HTTPing {
+	// -cfcolo only works in HTTPing mode, so enabling a Colo filter
+	// implicitly enables HTTPing as a user-friendly safeguard.
+	if c.HTTPing || len(c.Colo) > 0 {
 		args = append(args, "-httping")
 	}
 	if len(c.Colo) > 0 {
 		args = append(args, "-cfcolo", strings.Join(c.Colo, ","))
 	}
+	// We consume result.csv ourselves; suppress the verbose terminal result table.
+	args = append(args, "-p", "0")
 	if c.AllIP {
 		args = append(args, "-allip")
 	}
@@ -370,6 +380,44 @@ func sanitize(s string) string {
 		return '-'
 	}, s)
 }
+func summarizeCFSTError(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	needles := []string{
+		"invalid value",
+		"flag provided but not defined",
+		"invalid argument",
+		"parse error",
+		"no such file",
+		"permission denied",
+	}
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		lower := strings.ToLower(t)
+		for _, needle := range needles {
+			if strings.Contains(lower, needle) {
+				if len([]rune(t)) > 260 {
+					r := []rune(t)
+					return string(r[:260]) + "…"
+				}
+				return t
+			}
+		}
+	}
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "参数：") || strings.HasPrefix(t, "Usage of") || strings.HasPrefix(t, "CloudflareSpeedTest ") {
+			continue
+		}
+		if len([]rune(t)) > 260 {
+			r := []rune(t)
+			return string(r[:260]) + "…"
+		}
+		return t
+	}
+	return ""
+}
+
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
