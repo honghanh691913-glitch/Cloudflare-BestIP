@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yourname/bestip-manager/internal/config"
-	"github.com/yourname/bestip-manager/internal/engine"
-	"github.com/yourname/bestip-manager/internal/server"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/engine"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/server"
 )
 
 func main() {

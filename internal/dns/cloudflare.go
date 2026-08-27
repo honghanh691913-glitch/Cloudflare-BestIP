@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/yourname/bestip-manager/internal/config"
-	"github.com/yourname/bestip-manager/internal/engine"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/engine"
 )
 
 type CloudflareClient struct{ HTTP *http.Client }
@@ -41,11 +41,13 @@ func (c CloudflareClient) SyncTarget(ctx context.Context, p config.Provider, t c
 	desired := map[string][]string{"A": {}, "AAAA": {}}
 	for _, ref := range t.Sources {
 		rs := latest[ref.SourceID]
-		n := ref.Count
-		if n > len(rs) {
-			n = len(rs)
+		// Strict target semantics: if a source is configured to contribute N records,
+		// do not shrink DNS to fewer records after a bad/partial test run.
+		// The caller gets an error and the existing DNS set is left untouched.
+		if len(rs) < ref.Count {
+			return fmt.Errorf("source %s only has %d ready results; target requires %d", ref.SourceID, len(rs), ref.Count)
 		}
-		for _, r := range rs[:n] {
+		for _, r := range rs[:ref.Count] {
 			if r.Family == "ipv4" {
 				desired["A"] = append(desired["A"], r.IP)
 			} else {

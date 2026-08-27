@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/bestip-manager/internal/config"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
 )
 
 type Result struct {
@@ -76,7 +76,16 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	m.runMu.Unlock()
 	defer func() { m.runMu.Lock(); delete(m.running, s.ID); m.runMu.Unlock() }()
 
-	m.setStatus(SourceStatus{SourceID: s.ID, Running: true, Stage: "collecting inputs", StartedAt: time.Now()})
+	// Preserve the last known-good result set while a new run is in progress.
+	// A transient test/download failure must not erase data that DNS targets may still rely on.
+	prev := m.currentStatus(s.ID)
+	m.setStatus(SourceStatus{
+		SourceID:  s.ID,
+		Running:   true,
+		Stage:     "collecting inputs",
+		StartedAt: time.Now(),
+		Results:   append([]Result(nil), prev.Results...),
+	})
 	workdir, err := os.MkdirTemp("", "bestip-"+sanitize(s.ID)+"-")
 	if err != nil {
 		return m.fail(s.ID, err)
@@ -123,6 +132,11 @@ func (m *Manager) getStartedAt(id string) time.Time {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.status[id].StartedAt
+}
+func (m *Manager) currentStatus(id string) SourceStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status[id]
 }
 func (m *Manager) setStatus(st SourceStatus) {
 	m.mu.Lock()

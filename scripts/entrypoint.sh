@@ -1,5 +1,14 @@
 #!/bin/sh
 set -eu
+
+CONFIG_PATH="${BESTIP_CONFIG:-/data/config.json}"
+if [ ! -f "$CONFIG_PATH" ]; then
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  cp /app/config.example.json "$CONFIG_PATH"
+  chmod 600 "$CONFIG_PATH" || true
+  echo "Created initial config at $CONFIG_PATH"
+fi
+
 if ! command -v cfst >/dev/null 2>&1; then
   arch="$(uname -m)"
   case "$arch" in

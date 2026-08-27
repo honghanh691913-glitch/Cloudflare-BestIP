@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/bestip-manager/internal/config"
-	dnsx "github.com/yourname/bestip-manager/internal/dns"
-	"github.com/yourname/bestip-manager/internal/engine"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
+	dnsx "github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/dns"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/engine"
 )
 
 //go:embed web/*
@@ -26,10 +26,18 @@ type App struct {
 	dns          dnsx.CloudflareClient
 	mu           sync.Mutex
 	targetStatus map[string]any
+	slots        chan struct{}
 }
 
 func New(store *config.Store, eng *engine.Manager) *App {
-	return &App{Store: store, Engine: eng, targetStatus: map[string]any{}}
+	max := store.Get().MaxConcurrency
+	if max < 1 {
+		max = 2
+	}
+	return &App{
+		Store: store, Engine: eng, targetStatus: map[string]any{},
+		slots: make(chan struct{}, max),
+	}
 }
 
 func (a *App) Handler() http.Handler {
@@ -118,6 +126,9 @@ func (a *App) syncTargetHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) runAndPublish(s config.Source) {
+	// Global task slot shared by manual runs, run-all, and the scheduler.
+	a.slots <- struct{}{}
+	defer func() { <-a.slots }()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	if err := a.Engine.RunSource(ctx, s); err != nil {

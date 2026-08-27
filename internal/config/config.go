@@ -154,6 +154,12 @@ func Validate(c Config) error {
 	}
 	providerIDs := map[string]bool{}
 	for _, p := range c.Providers {
+		if p.ID == "" {
+			return errors.New("provider id cannot be empty")
+		}
+		if providerIDs[p.ID] {
+			return fmt.Errorf("duplicate provider id: %s", p.ID)
+		}
 		providerIDs[p.ID] = true
 	}
 	targetIDs := map[string]bool{}
