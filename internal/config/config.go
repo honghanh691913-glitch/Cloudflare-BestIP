@@ -14,6 +14,7 @@ import (
 const (
 	DefaultProbeURL       = "https://speed.cloudflare.com/cdn-cgi/trace"
 	DefaultSpeedURL       = "https://cf.090227.xyz/__down?bytes=99999999"
+	DefaultRealTestURL    = "https://www.google.com/generate_204"
 	DefaultMaxSampleCount = 10000
 )
 
@@ -27,6 +28,12 @@ type Config struct {
 	MaxSampleCount       int           `json:"max_sample_count,omitempty"`
 	FurnaceRetentionDays int           `json:"furnace_retention_days,omitempty"`
 	FurnaceAutoRank      bool          `json:"furnace_auto_rank"`
+	RealTestURL          string        `json:"real_test_url,omitempty"`
+	RealTestAttempts     int           `json:"real_test_attempts,omitempty"`
+	RealSpeedURL         string        `json:"real_speed_url,omitempty"`
+	RealSpeedBytesMB     int           `json:"real_speed_bytes_mb,omitempty"`
+	RealSpeedTopN        int           `json:"real_speed_top_n,omitempty"`
+	RealProfiles         []RealProfile `json:"real_profiles,omitempty"`
 	Providers            []Provider    `json:"providers"`
 	Sources              []Source      `json:"sources"`
 	Targets              []Target      `json:"targets"`
@@ -49,6 +56,29 @@ type Provider struct {
 	APIKey   string `json:"api_key,omitempty"`
 }
 
+type RealProfile struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Protocol     string `json:"protocol"` // currently vless
+	Server       string `json:"server"`   // template/original address; candidate IP replaces it during tests
+	Port         int    `json:"port"`
+	UUID         string `json:"uuid,omitempty"`
+	Encryption   string `json:"encryption,omitempty"`
+	Flow         string `json:"flow,omitempty"`
+	Network      string `json:"network,omitempty"`  // ws / grpc / httpupgrade
+	Security     string `json:"security,omitempty"` // tls / none
+	SNI          string `json:"sni,omitempty"`
+	Host         string `json:"host,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Fingerprint  string `json:"fingerprint,omitempty"`
+	ALPN         string `json:"alpn,omitempty"`
+	Insecure     bool   `json:"insecure,omitempty"`
+	ECH          string `json:"ech,omitempty"` // original URI field for round-trip/display
+	ECHQueryName string `json:"ech_query_name,omitempty"`
+	ECHDoH       string `json:"ech_doh,omitempty"`
+	RawURI       string `json:"raw_uri,omitempty"`
+}
+
 type Source struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
@@ -60,10 +90,22 @@ type Source struct {
 	SampleCount     int      `json:"sample_count,omitempty"` // total candidates per run, distributed across ranges
 	CFST            CFST     `json:"cfst"`
 
+	// Optional real application-layer validation through a saved proxy profile.
+	RealProfileID    string  `json:"real_profile_id,omitempty"`
+	RealLatencyMaxMS float64 `json:"real_latency_max_ms,omitempty"`
+	RealSpeedEnabled bool    `json:"real_speed_enabled,omitempty"`
+	RealSpeedMinMB   float64 `json:"real_speed_min_mb,omitempty"`
+
 	// Runtime-only global fallbacks populated by PrepareSource.
-	GlobalProbeURL  string `json:"-"`
-	GlobalSpeedURL  string `json:"-"`
-	GlobalMaxSample int    `json:"-"`
+	GlobalProbeURL      string       `json:"-"`
+	GlobalSpeedURL      string       `json:"-"`
+	GlobalMaxSample     int          `json:"-"`
+	GlobalRealTestURL   string       `json:"-"`
+	GlobalRealAttempts  int          `json:"-"`
+	GlobalRealSpeedURL  string       `json:"-"`
+	GlobalRealSpeedMB   int          `json:"-"`
+	GlobalRealSpeedTopN int          `json:"-"`
+	RealProfile         *RealProfile `json:"-"`
 }
 
 type CFST struct {
@@ -141,6 +183,30 @@ func ApplyDefaults(c *Config) {
 	if strings.TrimSpace(c.SpeedURL) == "" {
 		c.SpeedURL = DefaultSpeedURL
 	}
+	if strings.TrimSpace(c.RealTestURL) == "" {
+		c.RealTestURL = DefaultRealTestURL
+	}
+	if c.RealTestAttempts <= 0 {
+		c.RealTestAttempts = 2
+	}
+	if c.RealTestAttempts > 5 {
+		c.RealTestAttempts = 5
+	}
+	if strings.TrimSpace(c.RealSpeedURL) == "" {
+		c.RealSpeedURL = c.SpeedURL
+	}
+	if c.RealSpeedBytesMB <= 0 {
+		c.RealSpeedBytesMB = 5
+	}
+	if c.RealSpeedBytesMB > 100 {
+		c.RealSpeedBytesMB = 100
+	}
+	if c.RealSpeedTopN <= 0 {
+		c.RealSpeedTopN = 10
+	}
+	if c.RealSpeedTopN > 100 {
+		c.RealSpeedTopN = 100
+	}
 	if c.HealthCheckMinutes < 0 {
 		c.HealthCheckMinutes = 0
 	}
@@ -158,6 +224,30 @@ func ApplyDefaults(c *Config) {
 	}
 	if legacy {
 		c.FurnaceAutoRank = true
+	}
+	for i := range c.RealProfiles {
+		p := &c.RealProfiles[i]
+		p.Protocol = strings.ToLower(strings.TrimSpace(p.Protocol))
+		if p.Protocol == "" {
+			p.Protocol = "vless"
+		}
+		p.Network = strings.ToLower(strings.TrimSpace(p.Network))
+		if p.Network == "" {
+			p.Network = "ws"
+		}
+		p.Security = strings.ToLower(strings.TrimSpace(p.Security))
+		if p.Security == "" {
+			p.Security = "tls"
+		}
+		if p.Port <= 0 {
+			p.Port = 443
+		}
+		if strings.TrimSpace(p.Path) == "" {
+			p.Path = "/"
+		}
+		if strings.TrimSpace(p.Fingerprint) == "" && p.Security == "tls" {
+			p.Fingerprint = "chrome"
+		}
 	}
 	for i := range c.Sources {
 		s := &c.Sources[i]
@@ -379,6 +469,20 @@ func PrepareSource(c Config, s Source) Source {
 	s.GlobalProbeURL = c.ProbeURL
 	s.GlobalSpeedURL = c.SpeedURL
 	s.GlobalMaxSample = c.MaxSampleCount
+	s.GlobalRealTestURL = c.RealTestURL
+	s.GlobalRealAttempts = c.RealTestAttempts
+	s.GlobalRealSpeedURL = c.RealSpeedURL
+	s.GlobalRealSpeedMB = c.RealSpeedBytesMB
+	s.GlobalRealSpeedTopN = c.RealSpeedTopN
+	if strings.TrimSpace(s.RealProfileID) != "" {
+		for i := range c.RealProfiles {
+			if c.RealProfiles[i].ID == s.RealProfileID {
+				p := c.RealProfiles[i]
+				s.RealProfile = &p
+				break
+			}
+		}
+	}
 	if s.SampleCount <= 0 {
 		s.SampleCount = 256
 	}
@@ -404,6 +508,25 @@ func Validate(c Config) error {
 	if c.MaxSampleCount < 1 || c.MaxSampleCount > 100000 {
 		return fmt.Errorf("max_sample_count must be between 1 and 100000")
 	}
+	profileIDs := map[string]bool{}
+	for _, p := range c.RealProfiles {
+		if strings.TrimSpace(p.ID) == "" {
+			return errors.New("real profile id cannot be empty")
+		}
+		if profileIDs[p.ID] {
+			return fmt.Errorf("duplicate real profile id: %s", p.ID)
+		}
+		profileIDs[p.ID] = true
+		if strings.ToLower(strings.TrimSpace(p.Protocol)) != "vless" {
+			return fmt.Errorf("real profile %s: only vless is supported currently", p.ID)
+		}
+		if strings.TrimSpace(p.Server) == "" || p.Port < 1 || p.Port > 65535 || strings.TrimSpace(p.UUID) == "" {
+			return fmt.Errorf("real profile %s: server, valid port and uuid are required", p.ID)
+		}
+		if n := strings.ToLower(strings.TrimSpace(p.Network)); n != "" && n != "ws" {
+			return fmt.Errorf("real profile %s: v0.7 currently supports websocket transport", p.ID)
+		}
+	}
 	sourceIDs := map[string]bool{}
 	for _, s := range c.Sources {
 		if s.ID == "" {
@@ -415,6 +538,12 @@ func Validate(c Config) error {
 		sourceIDs[s.ID] = true
 		if s.Family != "ipv4" && s.Family != "ipv6" {
 			return fmt.Errorf("source %s: family must be ipv4 or ipv6", s.ID)
+		}
+		if strings.TrimSpace(s.RealProfileID) != "" && !profileIDs[s.RealProfileID] {
+			return fmt.Errorf("source %s: real_profile_id %s not found", s.ID, s.RealProfileID)
+		}
+		if s.RealLatencyMaxMS < 0 || s.RealSpeedMinMB < 0 {
+			return fmt.Errorf("source %s: real thresholds cannot be negative", s.ID)
 		}
 		if s.SampleCount < 1 {
 			return fmt.Errorf("source %s: sample_count must be >= 1", s.ID)

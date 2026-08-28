@@ -21,6 +21,7 @@ import (
 	dnsx "github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/dns"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/engine"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/furnace"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/reallink"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/updater"
 )
 
@@ -60,7 +61,7 @@ func New(store *config.Store, eng *engine.Manager, furnaceStore *furnace.Store) 
 		Store: store, Engine: eng, Furnace: furnaceStore,
 		targetStatus: map[string]any{}, healthStatus: map[string]any{}, lastHealth: map[string]time.Time{},
 		activeDNS: map[string][]engine.Result{},
-		slots: make(chan struct{}, max),
+		slots:     make(chan struct{}, max),
 	}
 }
 
@@ -73,6 +74,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/update/status", a.updateStatusHandler)
 	mux.HandleFunc("/api/update/apply", a.updateApplyHandler)
 	mux.HandleFunc("/api/provider/test", a.providerTestHandler)
+	mux.HandleFunc("/api/reallink/parse", a.realLinkParseHandler)
+	mux.HandleFunc("/api/reallink/test", a.realLinkTestHandler)
 	mux.HandleFunc("/api/run/source", a.runSourceHandler)
 	mux.HandleFunc("/api/stop/source", a.stopSourceHandler)
 	mux.HandleFunc("/api/run/all", a.runAllHandler)
@@ -112,12 +115,12 @@ func (a *App) statusHandler(w http.ResponseWriter, r *http.Request) {
 	active := cloneResultSlices(a.activeDNS)
 	a.mu.Unlock()
 	writeJSON(w, 200, map[string]any{
-		"sources": a.Engine.Snapshot(),
-		"targets": ts,
-		"health":  hs,
+		"sources":    a.Engine.Snapshot(),
+		"targets":    ts,
+		"health":     hs,
 		"active_dns": active,
-		"build":   buildPayload(),
-		"period":  furnace.PeriodName(time.Now()),
+		"build":      buildPayload(),
+		"period":     furnace.PeriodName(time.Now()),
 	})
 }
 
@@ -157,6 +160,7 @@ func buildPayload() map[string]any {
 		"image":            buildinfo.Image,
 		"repository":       buildinfo.Repository,
 		"web_update_ready": updater.Available(),
+		"real_test_ready":  reallink.Available(),
 	}
 }
 
@@ -372,17 +376,17 @@ func (a *App) updateApplyHandler(w http.ResponseWriter, r *http.Request) {
 		st := a.updateStatus
 		a.mu.Unlock()
 		writeJSON(w, 202, map[string]any{
-			"ok": true,
+			"ok":      true,
 			"message": "更新任务已经在运行",
-			"state": st,
+			"state":   st,
 		})
 		return
 	}
 	now := time.Now()
 	a.updateStatus = UpdateState{
-		Running: true,
-		Stage: "queued",
-		Message: "更新请求已提交，准备连接 Docker Engine",
+		Running:   true,
+		Stage:     "queued",
+		Message:   "更新请求已提交，准备连接 Docker Engine",
 		StartedAt: now,
 		UpdatedAt: now,
 	}
@@ -440,6 +444,65 @@ func (a *App) performWebUpdate(target, image string) {
 	// only be visible for 1-2 polls before the service disconnects, which is OK.
 	a.patchUpdateState("restarting", "镜像已拉取，正在重建容器；页面即将短暂断开", "", true)
 	log.Printf("[update] helper started; container restart imminent")
+}
+
+func (a *App) realLinkParseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(405)
+		return
+	}
+	var in struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	p, err := reallink.ParseURI(in.URI)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "profile": p, "core_ready": reallink.Available()})
+}
+
+func (a *App) realLinkTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(405)
+		return
+	}
+	var in struct {
+		Profile   config.RealProfile `json:"profile"`
+		Candidate string             `json:"candidate,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := reallink.ValidateProfile(in.Profile); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if !reallink.Available() {
+		writeErr(w, 409, fmt.Errorf("sing-box 真连接核心不可用；请先更新 Docker 镜像"))
+		return
+	}
+	c := a.Store.Get()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	candidate := strings.TrimSpace(in.Candidate)
+	if candidate == "" {
+		candidate = in.Profile.Server
+	}
+	latency, err := reallink.MeasureLatency(ctx, in.Profile, candidate, c.RealTestURL, c.RealTestAttempts)
+	if err != nil {
+		writeErr(w, 502, fmt.Errorf("真连接失败: %w", err))
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"ok": true, "candidate": candidate, "latency_ms": latency,
+		"test_url": c.RealTestURL,
+	})
 }
 
 func (a *App) providerTestHandler(w http.ResponseWriter, r *http.Request) {
@@ -733,7 +796,15 @@ func (a *App) runHealthCheck(s config.Source, required int, autoRefill bool) {
 	}
 	a.mu.Lock()
 	a.healthStatus[s.ID] = map[string]any{
-		"time": time.Now(), "running": !ok && autoRefill, "phase": func() string { if ok { return "healthy" }; if autoRefill { return "refill" }; return "degraded" }(),
+		"time": time.Now(), "running": !ok && autoRefill, "phase": func() string {
+			if ok {
+				return "healthy"
+			}
+			if autoRefill {
+				return "refill"
+			}
+			return "degraded"
+		}(),
 		"ok": ok, "checked": report.Checked, "healthy": len(healthy), "required": required,
 		"need": maxServerInt(0, required-len(healthy)), "rows": report.Rows,
 		"message": healthMessage(report, required),
@@ -842,7 +913,6 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	a.targetStatus[id] = st
 	return err
 }
-
 
 // BootstrapActiveDNS runs once after container start/update.
 // It validates the IPs that are already published in DNS and only fills
@@ -1098,7 +1168,10 @@ func (a *App) supplementSource(ctx context.Context, c config.Config, s config.So
 		log.Printf("[startup-health] source=%s supplement attempt sample=%d need=%d", s.ID, n, need)
 		a.mu.Lock()
 		if h, ok := a.healthStatus[s.ID].(map[string]any); ok {
-			h["running"] = true; h["phase"] = "refill"; h["sample"] = n; h["attempt"] = len(tried);
+			h["running"] = true
+			h["phase"] = "refill"
+			h["sample"] = n
+			h["attempt"] = len(tried)
 			h["message"] = fmt.Sprintf("自动补位：缺 %d 个，本轮从 %d 个候选中寻找", need, n)
 		}
 		a.mu.Unlock()

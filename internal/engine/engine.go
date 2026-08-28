@@ -23,19 +23,24 @@ import (
 	"time"
 
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/reallink"
 )
 
 type Result struct {
-	IP           string    `json:"ip"`
-	Family       string    `json:"family"`
-	Colo         string    `json:"colo,omitempty"`
-	LatencyMS    float64   `json:"latency_ms,omitempty"`
-	Loss         float64   `json:"loss,omitempty"`
-	SpeedMB      float64   `json:"speed_mb,omitempty"`
-	SpeedTested  bool      `json:"speed_tested"`
-	Qualified    bool      `json:"qualified"`
-	RejectReason string    `json:"reject_reason,omitempty"`
-	TestedAt     time.Time `json:"tested_at"`
+	IP              string    `json:"ip"`
+	Family          string    `json:"family"`
+	Colo            string    `json:"colo,omitempty"`
+	LatencyMS       float64   `json:"latency_ms,omitempty"`
+	Loss            float64   `json:"loss,omitempty"`
+	SpeedMB         float64   `json:"speed_mb,omitempty"`
+	SpeedTested     bool      `json:"speed_tested"`
+	RealLatencyMS   float64   `json:"real_latency_ms,omitempty"`
+	RealTested      bool      `json:"real_tested,omitempty"`
+	RealSpeedMB     float64   `json:"real_speed_mb,omitempty"`
+	RealSpeedTested bool      `json:"real_speed_tested,omitempty"`
+	Qualified       bool      `json:"qualified"`
+	RejectReason    string    `json:"reject_reason,omitempty"`
+	TestedAt        time.Time `json:"tested_at"`
 }
 
 type ScanProgress struct {
@@ -55,8 +60,12 @@ type FunnelStats struct {
 	LatencyPassed   int `json:"latency_passed"`
 	LossPassed      int `json:"loss_passed"`
 	RegionPassed    int `json:"region_passed"`
+	RealTested      int `json:"real_tested"`
+	RealPassed      int `json:"real_passed"`
 	SpeedTested     int `json:"speed_tested"`
 	SpeedPassed     int `json:"speed_passed"`
+	RealSpeedTested int `json:"real_speed_tested"`
+	RealSpeedPassed int `json:"real_speed_passed"`
 }
 
 type SourceStatus struct {
@@ -88,7 +97,7 @@ type Manager struct {
 
 func NewManager() *Manager {
 	return &Manager{
-		status: map[string]SourceStatus{},
+		status:  map[string]SourceStatus{},
 		history: map[string][]Result{},
 		running: map[string]bool{},
 		cancels: map[string]context.CancelFunc{},
@@ -331,6 +340,22 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 		return m.fail(s.ID, fmt.Errorf("延迟/丢包已通过，但没有 IP 匹配地区 %s", strings.Join(s.CFST.Colo, ",")))
 	}
 
+	// Round 2.5: optional true application-layer connection test.
+	// This keeps UUID/SNI/WS Host/path/TLS/ECH unchanged and replaces only the
+	// VLESS server address with each candidate IP. TCPing can look excellent
+	// while the actual proxy handshake is broken or much slower.
+	if s.RealProfile != nil {
+		if !reallink.Available() {
+			return m.fail(s.ID, fmt.Errorf("已选择真连接节点 %q，但 sing-box 核心不可用；请更新 Docker 镜像", s.RealProfile.Name))
+		}
+		m.patchStage(s.ID, "真连接测试")
+		finalists = m.filterByRealLink(ctx, s.ID, s, finalists)
+		funnel = m.currentStatus(s.ID).Funnel
+		if len(finalists) == 0 {
+			return m.fail(s.ID, fmt.Errorf("真连接测试完成，但没有候选 IP 能通过节点 %s", s.RealProfile.Name))
+		}
+	}
+
 	for i := range finalists {
 		finalists[i].Qualified = false
 		finalists[i].SpeedTested = false
@@ -400,6 +425,17 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 		return m.fail(s.ID, fmt.Errorf("速度决赛完成，但没有 IP 达到 %.2f MB/s 的速度及格线", s.CFST.SpeedMinMB))
 	}
 
+	// Optional true-speed final through the actual VLESS tunnel. To bound traffic,
+	// only the direct-speed leaders are tested and each candidate is capped by
+	// GlobalRealSpeedMB (default 5 MB). Untested candidates remain as fallback.
+	if s.RealProfile != nil && s.RealSpeedEnabled {
+		m.patchStage(s.ID, "真测速决赛")
+		qualified = m.applyRealSpeed(ctx, s.ID, s, qualified)
+		if len(qualified) == 0 {
+			return m.fail(s.ID, fmt.Errorf("真测速完成，但没有候选达到真速度要求"))
+		}
+	}
+
 	keep := s.KeepResults
 	if keep <= 0 {
 		keep = 50
@@ -415,8 +451,12 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	st.EndedAt = time.Now()
 	st.LastUpdate = time.Now()
 	st.Results = append([]Result(nil), qualified...)
-	st.Observed = sortObservedForDisplay(finalists)
-	st.ObservedTotal = len(finalists)
+	if s.RealProfile != nil && s.RealSpeedEnabled {
+		st.Observed = sortObservedForDisplay(m.currentStatus(s.ID).Observed)
+	} else {
+		st.Observed = sortObservedForDisplay(finalists)
+	}
+	st.ObservedTotal = len(st.Observed)
 	st.Progress = ScanProgress{
 		Phase:     "done",
 		Current:   len(finalists),
@@ -427,9 +467,164 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	st.Funnel.SpeedTested = len(finalists)
 	st.Funnel.SpeedPassed = len(qualified)
 	m.setStatus(st)
-	m.logf(s.ID, "STRICT DONE finalists=%d qualified=%d best=%s %.2fMB/s elapsed=%s",
-		len(finalists), len(qualified), qualified[0].IP, qualified[0].SpeedMB, time.Since(started).Round(time.Millisecond))
+	if qualified[0].RealSpeedTested {
+		m.logf(s.ID, "STRICT DONE finalists=%d qualified=%d best=%s direct=%.2fMB/s real=%.2fMB/s real_latency=%.1fms elapsed=%s",
+			len(finalists), len(qualified), qualified[0].IP, qualified[0].SpeedMB, qualified[0].RealSpeedMB, qualified[0].RealLatencyMS, time.Since(started).Round(time.Millisecond))
+	} else {
+		m.logf(s.ID, "STRICT DONE finalists=%d qualified=%d best=%s %.2fMB/s real_latency=%.1fms elapsed=%s",
+			len(finalists), len(qualified), qualified[0].IP, qualified[0].SpeedMB, qualified[0].RealLatencyMS, time.Since(started).Round(time.Millisecond))
+	}
 	return nil
+}
+
+func (m *Manager) filterByRealLink(ctx context.Context, sourceID string, s config.Source, rows []Result) []Result {
+	if s.RealProfile == nil {
+		return rows
+	}
+	out := append([]Result(nil), rows...)
+	passed := make([]Result, 0, len(out))
+	total := len(out)
+	for i := range out {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		latency, err := reallink.MeasureLatency(ctx, *s.RealProfile, out[i].IP, s.GlobalRealTestURL, s.GlobalRealAttempts)
+		out[i].RealTested = true
+		out[i].TestedAt = time.Now()
+		if err != nil {
+			out[i].Qualified = false
+			out[i].RejectReason = "真连接失败：" + compactReason(err.Error())
+			m.logf(sourceID, "REAL %d/%d ip=%s failed=%v", i+1, total, out[i].IP, err)
+		} else {
+			out[i].RealLatencyMS = latency
+			if s.RealLatencyMaxMS > 0 && latency > s.RealLatencyMaxMS {
+				out[i].Qualified = false
+				out[i].RejectReason = fmt.Sprintf("真连接延迟 %.1fms > %.1fms", latency, s.RealLatencyMaxMS)
+				m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms NOT_QUALIFIED", i+1, total, out[i].IP, latency)
+			} else {
+				out[i].Qualified = true
+				out[i].RejectReason = ""
+				passed = append(passed, out[i])
+				m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms QUALIFIED", i+1, total, out[i].IP, latency)
+			}
+		}
+		m.updateHistoryRow(sourceID, out[i])
+		f := m.currentStatus(sourceID).Funnel
+		f.RealTested = i + 1
+		f.RealPassed = len(passed)
+		m.patchFunnel(sourceID, f)
+		m.patchProgress(sourceID, ScanProgress{Phase: "real", Current: i + 1, Total: total, Available: len(passed)})
+		m.setObserved(sourceID, sortRealObserved(out[:i+1], out[i+1:]))
+	}
+	return passed
+}
+
+func sortRealObserved(done, waiting []Result) []Result {
+	out := append([]Result(nil), done...)
+	sort.SliceStable(out, func(i, j int) bool {
+		qi, qj := out[i].Qualified, out[j].Qualified
+		if qi != qj {
+			return qi
+		}
+		if qi && out[i].RealLatencyMS != out[j].RealLatencyMS {
+			return out[i].RealLatencyMS < out[j].RealLatencyMS
+		}
+		return out[i].LatencyMS < out[j].LatencyMS
+	})
+	out = append(out, waiting...)
+	return out
+}
+
+func (m *Manager) applyRealSpeed(ctx context.Context, sourceID string, s config.Source, qualified []Result) []Result {
+	out := append([]Result(nil), qualified...)
+	topN := s.GlobalRealSpeedTopN
+	if topN <= 0 {
+		topN = 10
+	}
+	if topN > len(out) {
+		topN = len(out)
+	}
+	for i := 0; i < topN; i++ {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		speed, err := reallink.MeasureSpeed(ctx, *s.RealProfile, out[i].IP, s.GlobalRealSpeedURL, s.GlobalRealSpeedMB)
+		out[i].RealSpeedTested = true
+		out[i].TestedAt = time.Now()
+		if err != nil {
+			out[i].Qualified = false
+			out[i].RejectReason = "真测速失败：" + compactReason(err.Error())
+			m.logf(sourceID, "REAL_SPEED %d/%d ip=%s failed=%v", i+1, topN, out[i].IP, err)
+		} else {
+			out[i].RealSpeedMB = speed
+			if s.RealSpeedMinMB > 0 && speed < s.RealSpeedMinMB {
+				out[i].Qualified = false
+				out[i].RejectReason = fmt.Sprintf("真速度 %.2f MB/s < %.2f MB/s", speed, s.RealSpeedMinMB)
+				m.logf(sourceID, "REAL_SPEED %d/%d ip=%s speed=%.2fMB/s NOT_QUALIFIED", i+1, topN, out[i].IP, speed)
+			} else {
+				m.logf(sourceID, "REAL_SPEED %d/%d ip=%s speed=%.2fMB/s QUALIFIED", i+1, topN, out[i].IP, speed)
+			}
+		}
+		m.updateHistoryRow(sourceID, out[i])
+		f := m.currentStatus(sourceID).Funnel
+		f.RealSpeedTested = i + 1
+		f.RealSpeedPassed = countRealSpeedQualified(out[:i+1])
+		m.patchFunnel(sourceID, f)
+		m.patchProgress(sourceID, ScanProgress{Phase: "real_speed", Current: i + 1, Total: topN, Available: f.RealSpeedPassed})
+	}
+	// Merge true-speed measurements back into the full observed candidate set
+	// so the detail UI can show both direct and real metrics after completion.
+	observed := m.currentStatus(sourceID).Observed
+	for _, updated := range out {
+		for i := range observed {
+			if observed[i].IP == updated.IP {
+				observed[i] = updated
+				break
+			}
+		}
+	}
+	m.setObserved(sourceID, sortObservedForDisplay(observed))
+
+	filtered := out[:0]
+	for _, r := range out {
+		if !r.Qualified {
+			continue
+		}
+		if s.RealSpeedMinMB > 0 && !r.RealSpeedTested {
+			// A configured real-speed threshold is strict: an untested candidate
+			// cannot be considered to have passed it. Increase "真测速最多候选"
+			// if more fallback candidates should be verified.
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		// Actually measured real speed is the strongest ranking signal.
+		if filtered[i].RealSpeedTested != filtered[j].RealSpeedTested {
+			return filtered[i].RealSpeedTested
+		}
+		if filtered[i].RealSpeedTested && filtered[i].RealSpeedMB != filtered[j].RealSpeedMB {
+			return filtered[i].RealSpeedMB > filtered[j].RealSpeedMB
+		}
+		if filtered[i].SpeedMB != filtered[j].SpeedMB {
+			return filtered[i].SpeedMB > filtered[j].SpeedMB
+		}
+		if filtered[i].RealLatencyMS != filtered[j].RealLatencyMS && filtered[i].RealLatencyMS > 0 && filtered[j].RealLatencyMS > 0 {
+			return filtered[i].RealLatencyMS < filtered[j].RealLatencyMS
+		}
+		return filtered[i].LatencyMS < filtered[j].LatencyMS
+	})
+	return filtered
+}
+
+func countRealSpeedQualified(rows []Result) int {
+	n := 0
+	for _, r := range rows {
+		if r.RealSpeedTested && r.Qualified {
+			n++
+		}
+	}
+	return n
 }
 
 func countQualified(rows []Result) int {
@@ -1019,7 +1214,9 @@ func (m *Manager) patchProgress(id string, p ScanProgress) {
 	}
 	if !p.StartedAt.IsZero() {
 		elapsed := int(now.Sub(p.StartedAt).Seconds())
-		if elapsed < 0 { elapsed = 0 }
+		if elapsed < 0 {
+			elapsed = 0
+		}
 		p.ElapsedSeconds = elapsed
 		if p.Current > 0 && p.Total > p.Current && elapsed > 0 {
 			p.ETASeconds = int(float64(elapsed) * float64(p.Total-p.Current) / float64(p.Current))

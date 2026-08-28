@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/reallink"
 )
 
 type HealthReport struct {
@@ -97,7 +98,12 @@ func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Re
 	st.LastUpdate = time.Now()
 	st.Observed = append([]Result(nil), report.Rows...)
 	st.ObservedTotal = len(report.Rows)
-	st.Progress = ScanProgress{Phase: "health", Current: report.Checked, Total: len(current), Available: report.Healthy, Percent: func() int { if len(current)>0 { return report.Checked*100/len(current) }; return 100 }(), StartedAt: started, ElapsedSeconds: int(time.Since(started).Seconds())}
+	st.Progress = ScanProgress{Phase: "health", Current: report.Checked, Total: len(current), Available: report.Healthy, Percent: func() int {
+		if len(current) > 0 {
+			return report.Checked * 100 / len(current)
+		}
+		return 100
+	}(), StartedAt: started, ElapsedSeconds: int(time.Since(started).Seconds())}
 	m.setStatus(st)
 	m.logf(s.ID, "HEALTH DONE checked=%d healthy=%d/%d elapsed=%s", report.Checked, report.Healthy, len(current), time.Since(started).Round(time.Millisecond))
 	return report
@@ -136,6 +142,18 @@ func checkHealthOnce(ctx context.Context, s config.Source, old Result) Result {
 	} else if strings.TrimSpace(r.Colo) == "" {
 		if colo, err := fetchColo(ctx, s, r.IP); err == nil {
 			r.Colo = colo
+		}
+	}
+	if r.RejectReason == "" && s.RealProfile != nil {
+		latency, err := reallink.MeasureLatency(ctx, *s.RealProfile, r.IP, s.GlobalRealTestURL, s.GlobalRealAttempts)
+		r.RealTested = true
+		if err != nil {
+			r.RejectReason = "健康检查：真连接失败"
+		} else {
+			r.RealLatencyMS = latency
+			if s.RealLatencyMaxMS > 0 && latency > s.RealLatencyMaxMS {
+				r.RejectReason = fmt.Sprintf("健康检查：真延迟 %.1fms > %.1fms", latency, s.RealLatencyMaxMS)
+			}
 		}
 	}
 	if r.RejectReason == "" {
@@ -242,7 +260,6 @@ func (m *Manager) ApplyHealthyRefresh(sourceID string, rows []Result) bool {
 	m.status[sourceID] = st
 	return true
 }
-
 
 // SeedResults hydrates the in-memory source state from records that already
 // exist in DNS and have just passed a fresh health check.
