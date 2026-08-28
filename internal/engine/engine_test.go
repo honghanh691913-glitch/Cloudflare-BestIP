@@ -1,15 +1,15 @@
 package engine
 
 import (
-	"reflect"
-	"path/filepath"
-	"os"
 	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,16 +41,15 @@ func TestBuildProbeArgsIsLightweightAndExactCandidates(t *testing.T) {
 	}
 }
 
-
 func TestBuildProbeArgsForcesTCPEvenWhenLegacyHTTPingEnabled(t *testing.T) {
 	s := config.Source{
 		Family: "ipv4",
 		CFST: config.CFST{
-			Threads: 200,
+			Threads:   200,
 			PingCount: 4,
-			Port: 443,
-			HTTPing: true,
-			ProbeURL: "https://speed.cloudflare.com/cdn-cgi/trace",
+			Port:      443,
+			HTTPing:   true,
+			ProbeURL:  "https://speed.cloudflare.com/cdn-cgi/trace",
 		},
 	}
 	joined := strings.Join(buildProbeArgs(s, "/tmp/in.txt", "/tmp/probe.csv"), " ")
@@ -121,19 +120,18 @@ func TestCFSTStreamUpdatesProgress(t *testing.T) {
 	}
 }
 
-
 func TestMergeResultsPreservesHealthyAndFillsDeficit(t *testing.T) {
 	m := NewManager()
 	healthy := []Result{
-		{IP:"1.1.1.1", Family:"ipv4", SpeedMB:60, LatencyMS:20, Qualified:true, SpeedTested:true},
-		{IP:"1.1.1.2", Family:"ipv4", SpeedMB:55, LatencyMS:22, Qualified:true, SpeedTested:true},
-		{IP:"1.1.1.3", Family:"ipv4", SpeedMB:50, LatencyMS:25, Qualified:true, SpeedTested:true},
+		{IP: "1.1.1.1", Family: "ipv4", SpeedMB: 60, LatencyMS: 20, Qualified: true, SpeedTested: true},
+		{IP: "1.1.1.2", Family: "ipv4", SpeedMB: 55, LatencyMS: 22, Qualified: true, SpeedTested: true},
+		{IP: "1.1.1.3", Family: "ipv4", SpeedMB: 50, LatencyMS: 25, Qualified: true, SpeedTested: true},
 	}
 	supp := []Result{
-		{IP:"1.1.1.2", Family:"ipv4", SpeedMB:80, LatencyMS:18, Qualified:true, SpeedTested:true}, // duplicate
-		{IP:"1.1.1.4", Family:"ipv4", SpeedMB:70, LatencyMS:19, Qualified:true, SpeedTested:true},
-		{IP:"1.1.1.5", Family:"ipv4", SpeedMB:65, LatencyMS:21, Qualified:true, SpeedTested:true},
-		{IP:"1.1.1.6", Family:"ipv4", SpeedMB:90, LatencyMS:15, Qualified:false, SpeedTested:true}, // reject
+		{IP: "1.1.1.2", Family: "ipv4", SpeedMB: 80, LatencyMS: 18, Qualified: true, SpeedTested: true}, // duplicate
+		{IP: "1.1.1.4", Family: "ipv4", SpeedMB: 70, LatencyMS: 19, Qualified: true, SpeedTested: true},
+		{IP: "1.1.1.5", Family: "ipv4", SpeedMB: 65, LatencyMS: 21, Qualified: true, SpeedTested: true},
+		{IP: "1.1.1.6", Family: "ipv4", SpeedMB: 90, LatencyMS: 15, Qualified: false, SpeedTested: true}, // reject
 	}
 	got := m.MergeResults("s1", healthy, supp, 5)
 	if len(got) != 5 {
@@ -146,69 +144,91 @@ func TestMergeResultsPreservesHealthyAndFillsDeficit(t *testing.T) {
 		}
 		seen[r.IP] = true
 	}
-	for _, ip := range []string{"1.1.1.1","1.1.1.2","1.1.1.3","1.1.1.4","1.1.1.5"} {
+	for _, ip := range []string{"1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5"} {
 		if !seen[ip] {
 			t.Fatalf("missing %s in %#v", ip, got)
 		}
 	}
 }
 
-
 func TestPatchProgressCarriesPhaseTimer(t *testing.T) {
 	m := NewManager()
-	m.patchProgress("p", ScanProgress{Phase:"speed", Current:1, Total:4})
+	m.patchProgress("p", ScanProgress{Phase: "speed", Current: 1, Total: 4})
 	time.Sleep(1100 * time.Millisecond)
-	m.patchProgress("p", ScanProgress{Phase:"speed", Current:2, Total:4})
+	m.patchProgress("p", ScanProgress{Phase: "speed", Current: 2, Total: 4})
 	p := m.Snapshot()["p"].Progress
-	if p.Percent != 50 { t.Fatalf("percent=%d", p.Percent) }
-	if p.StartedAt.IsZero() || p.ElapsedSeconds < 1 { t.Fatalf("timer not carried: %#v", p) }
-	if p.ETASeconds < 1 { t.Fatalf("eta not computed: %#v", p) }
+	if p.Percent != 50 {
+		t.Fatalf("percent=%d", p.Percent)
+	}
+	if p.StartedAt.IsZero() || p.ElapsedSeconds < 1 {
+		t.Fatalf("timer not carried: %#v", p)
+	}
+	if p.ETASeconds < 1 {
+		t.Fatalf("eta not computed: %#v", p)
+	}
 }
-
 
 func TestMergeResultsNeverEvictsHealthySurvivors(t *testing.T) {
 	m := NewManager()
 	healthy := []Result{
-		{IP:"1.1.1.1",Qualified:true,SpeedMB:31},
-		{IP:"1.1.1.2",Qualified:true,SpeedMB:32},
-		{IP:"1.1.1.3",Qualified:true,SpeedMB:33},
-		{IP:"1.1.1.4",Qualified:true,SpeedMB:34},
+		{IP: "1.1.1.1", Qualified: true, SpeedMB: 31},
+		{IP: "1.1.1.2", Qualified: true, SpeedMB: 32},
+		{IP: "1.1.1.3", Qualified: true, SpeedMB: 33},
+		{IP: "1.1.1.4", Qualified: true, SpeedMB: 34},
 	}
 	// New candidates are much faster, but health refill must only fill the one missing slot.
 	supp := []Result{
-		{IP:"2.2.2.1",Qualified:true,SpeedMB:100},
-		{IP:"2.2.2.2",Qualified:true,SpeedMB:99},
-		{IP:"2.2.2.3",Qualified:true,SpeedMB:98},
+		{IP: "2.2.2.1", Qualified: true, SpeedMB: 100},
+		{IP: "2.2.2.2", Qualified: true, SpeedMB: 99},
+		{IP: "2.2.2.3", Qualified: true, SpeedMB: 98},
 	}
 	got := m.MergeResults("s", healthy, supp, 5)
-	if len(got) != 5 { t.Fatalf("len=%d",len(got)) }
-	seen:=map[string]bool{}
-	for _,r:=range got { seen[r.IP]=true }
-	for _,ip:=range []string{"1.1.1.1","1.1.1.2","1.1.1.3","1.1.1.4"} {
-		if !seen[ip] { t.Fatalf("healthy survivor %s was evicted: %#v",ip,got) }
+	if len(got) != 5 {
+		t.Fatalf("len=%d", len(got))
 	}
-	nNew:=0
-	for _,r:=range got { if strings.HasPrefix(r.IP,"2.2.2.") { nNew++ } }
-	if nNew!=1 { t.Fatalf("expected exactly 1 refill IP, got %d: %#v",nNew,got) }
+	seen := map[string]bool{}
+	for _, r := range got {
+		seen[r.IP] = true
+	}
+	for _, ip := range []string{"1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4"} {
+		if !seen[ip] {
+			t.Fatalf("healthy survivor %s was evicted: %#v", ip, got)
+		}
+	}
+	nNew := 0
+	for _, r := range got {
+		if strings.HasPrefix(r.IP, "2.2.2.") {
+			nNew++
+		}
+	}
+	if nNew != 1 {
+		t.Fatalf("expected exactly 1 refill IP, got %d: %#v", nNew, got)
+	}
 }
 
 func TestStopSourceCancelsActiveRun(t *testing.T) {
-	m:=NewManager()
-	ctx,cancel:=context.WithCancel(context.Background())
+	m := NewManager()
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	runCtx,ok:=m.beginRun(ctx,"s")
-	if !ok { t.Fatal("beginRun failed") }
-	done:=make(chan struct{})
-	go func(){ <-runCtx.Done(); close(done) }()
-	if !m.StopSource("s") { t.Fatal("StopSource returned false") }
-	select{
+	runCtx, ok := m.beginRun(ctx, "s")
+	if !ok {
+		t.Fatal("beginRun failed")
+	}
+	done := make(chan struct{})
+	go func() { <-runCtx.Done(); close(done) }()
+	if !m.StopSource("s") {
+		t.Fatal("StopSource returned false")
+	}
+	select {
 	case <-done:
-	case <-time.After(time.Second): t.Fatal("cancel did not propagate")
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not propagate")
 	}
 	m.endRun("s")
-	if m.IsRunning("s") { t.Fatal("source still running") }
+	if m.IsRunning("s") {
+		t.Fatal("source still running")
+	}
 }
-
 
 func TestNormalizeDecoratedIPInput(t *testing.T) {
 	cases := []struct {
@@ -236,7 +256,7 @@ func TestCollectInputsDecoratedBestIPList(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "normalized.txt")
 	s := config.Source{
-		ID: "decorated",
+		ID:     "decorated",
 		Family: "ipv4",
 		Inputs: []string{
 			"190.93.246.167:443#46.08MB/s-LAX",
@@ -258,10 +278,10 @@ func TestCollectInputsDecoratedBestIPList(t *testing.T) {
 	}
 	got := strings.Fields(string(b))
 	want := []string{
-		"190.93.246.167",
-		"104.16.146.116",
-		"104.16.123.147",
-		"104.16.170.72",
+		"seed:190.93.246.167",
+		"seed:104.16.146.116",
+		"seed:104.16.123.147",
+		"seed:104.16.170.72",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized=%#v want %#v", got, want)
@@ -274,5 +294,31 @@ func TestNormalizeInputRejectsWrongFamily(t *testing.T) {
 	}
 	if _, ok := normalizeInputEntry("[2606:4700::1111]:443#NRT", "ipv4"); ok {
 		t.Fatal("IPv6 accepted as IPv4")
+	}
+}
+
+func TestCollectInputsMarksManualSingleIPsAsSeeds(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "ranges.txt")
+	s := config.Source{
+		ID:     "seed-test",
+		Family: "ipv4",
+		Inputs: []string{
+			"104.17.79.30",
+			"104.17.79.0/24",
+			"104.18.0.0/24",
+		},
+	}
+	_, err := collectInputs(context.Background(), s, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(out)
+	text := string(b)
+	if !strings.Contains(text, "seed:104.17.79.30") {
+		t.Fatalf("manual single IP was not marked seed: %s", text)
+	}
+	if strings.Contains(text, "seed:104.17.79.0/24") {
+		t.Fatalf("CIDR must not become seed: %s", text)
 	}
 }

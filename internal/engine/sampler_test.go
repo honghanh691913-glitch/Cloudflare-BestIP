@@ -90,3 +90,58 @@ func TestIPv4MultipleRangesEvenAllocation(t *testing.T) {
 		t.Fatalf("expected even 100-per-range allocation: %s", joined)
 	}
 }
+
+func TestFixedSeedsAlwaysIncludedWithOverlappingCIDR(t *testing.T) {
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "ranges.txt")
+	out := filepath.Join(dir, "candidates.txt")
+	content := strings.Join([]string{
+		"seed:104.18.29.34",
+		"seed:104.16.4.14",
+		"seed:104.18.23.19",
+		"seed:104.17.78.30",
+		"seed:104.17.79.30",
+		"104.17.79.0/24",
+		"104.17.0.0/24",
+		"104.18.0.0/24",
+	}, "\n") + "\n"
+	if err := os.WriteFile(raw, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	n, notes, err := sampleCandidateFile(raw, out, "ipv4", 256, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 256 {
+		t.Fatalf("expected 256 candidates, got %d", n)
+	}
+	b, _ := os.ReadFile(out)
+	seen := map[string]int{}
+	for _, ip := range strings.Fields(string(b)) {
+		seen[ip]++
+	}
+	for _, seed := range []string{"104.18.29.34", "104.16.4.14", "104.18.23.19", "104.17.78.30", "104.17.79.30"} {
+		if seen[seed] != 1 {
+			t.Fatalf("fixed seed %s count=%d, want exactly 1", seed, seen[seed])
+		}
+	}
+	if !strings.Contains(strings.Join(notes, "|"), "固定种子=5") {
+		t.Fatalf("notes missing fixed seed count: %#v", notes)
+	}
+}
+
+func TestRequestedBelowSeedCountStillIncludesEverySeed(t *testing.T) {
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "ranges.txt")
+	out := filepath.Join(dir, "candidates.txt")
+	if err := os.WriteFile(raw, []byte("seed:1.1.1.1\nseed:1.1.1.2\nseed:1.1.1.3\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := sampleCandidateFile(raw, out, "ipv4", 1, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("mandatory seeds must expand sample to 3, got %d", n)
+	}
+}

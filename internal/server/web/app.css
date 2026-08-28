@@ -77,3 +77,5 @@ button,input,select,textarea{font:inherit}.primary,.ghost,.icon-btn,.more,.run,.
 .real-line-box{padding:9px;margin:9px 0;border:1px solid rgba(66,153,225,.25);border-radius:12px;background:rgba(41,113,190,.06)}
 .result-row small{display:block;color:var(--muted);font-size:8px;margin-top:2px}
 @media(max-width:640px){.real-paste{grid-template-columns:1fr}.real-profile-card{flex-direction:column}.real-profile-actions{justify-content:flex-start}}
+
+.speed-hint{font-size:9px;color:var(--muted);padding:6px 8px;margin:5px 0;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.015)}

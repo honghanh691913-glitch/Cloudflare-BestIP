@@ -17,6 +17,7 @@ import (
 type candidateRange struct {
 	raw      string
 	family   string
+	seed     bool
 	base     net.IP
 	net      *net.IPNet
 	prefix   int
@@ -36,6 +37,11 @@ func parseCandidateRanges(path, family string) ([]candidateRange, error) {
 		line := strings.TrimSpace(s.Text())
 		if line == "" {
 			continue
+		}
+		isSeed := false
+		if strings.HasPrefix(line, "seed:") {
+			isSeed = true
+			line = strings.TrimSpace(strings.TrimPrefix(line, "seed:"))
 		}
 		cidr := line
 		if !strings.Contains(cidr, "/") {
@@ -68,7 +74,7 @@ func parseCandidateRanges(path, family string) ([]candidateRange, error) {
 		} else {
 			base = base.To16()
 		}
-		out = append(out, candidateRange{raw: line, family: family, base: append(net.IP(nil), base...), net: ipnet, prefix: ones, bits: bits, capacity: cap})
+		out = append(out, candidateRange{raw: line, family: family, seed: isSeed, base: append(net.IP(nil), base...), net: ipnet, prefix: ones, bits: bits, capacity: cap})
 	}
 	if err := s.Err(); err != nil {
 		return nil, err
@@ -170,13 +176,27 @@ func allocateSamples(ranges []candidateRange, total int) []int {
 	return alloc
 }
 
+func canonicalRangeHost(r candidateRange) string {
+	if r.family == "ipv4" {
+		return r.base.To4().String()
+	}
+	return r.base.To16().String()
+}
+
 func sampleCandidateFile(rawPath, outPath, family string, requested, hardMax int) (int, []string, error) {
 	ranges, err := parseCandidateRanges(rawPath, family)
 	if err != nil {
 		return 0, nil, err
 	}
-	total := clampSampleCount(ranges, requested, hardMax)
-	alloc := allocateSamples(ranges, total)
+	if hardMax <= 0 {
+		hardMax = 10000
+	}
+	if requested <= 0 {
+		requested = 256
+	}
+	if requested > hardMax {
+		requested = hardMax
+	}
 
 	seedBytes := make([]byte, 8)
 	_, _ = crand.Read(seedBytes)
@@ -184,23 +204,67 @@ func sampleCandidateFile(rawPath, outPath, family string, requested, hardMax int
 	rng := rand.New(rand.NewSource(seed))
 
 	seen := map[string]bool{}
-	ips := make([]string, 0, total)
-	allocationNotes := make([]string, 0, len(ranges))
-	for i, r := range ranges {
+	seeds := make([]string, 0)
+	pools := make([]candidateRange, 0, len(ranges))
+	for _, r := range ranges {
+		if r.seed {
+			ip := canonicalRangeHost(r)
+			if !seen[ip] {
+				seen[ip] = true
+				seeds = append(seeds, ip)
+			}
+			continue
+		}
+		pools = append(pools, r)
+	}
+	if len(seeds) > hardMax {
+		return 0, nil, fmt.Errorf("fixed seed count %d exceeds hard max %d", len(seeds), hardMax)
+	}
+
+	target := requested
+	if target < len(seeds) {
+		target = len(seeds)
+	}
+	remaining := target - len(seeds)
+
+	rng.Shuffle(len(pools), func(i, j int) { pools[i], pools[j] = pools[j], pools[i] })
+
+	poolTarget := 0
+	alloc := make([]int, len(pools))
+	if remaining > 0 && len(pools) > 0 {
+		poolTarget = clampSampleCount(pools, remaining, hardMax-len(seeds))
+		alloc = allocateSamples(pools, poolTarget)
+	}
+
+	ips := make([]string, 0, len(seeds)+poolTarget)
+	ips = append(ips, seeds...)
+	allocationNotes := []string{
+		fmt.Sprintf("固定种子=%d", len(seeds)),
+		fmt.Sprintf("挑战名额=%d", poolTarget),
+	}
+
+	for i, r := range pools {
 		want := alloc[i]
+		if want <= 0 {
+			continue
+		}
 		allocationNotes = append(allocationNotes, fmt.Sprintf("%s=%d", r.raw, want))
-		generated := sampleRange(r, want, rng)
-		for _, ip := range generated {
+		for _, ip := range sampleRange(r, want, rng) {
 			if !seen[ip] {
 				seen[ip] = true
 				ips = append(ips, ip)
 			}
 		}
 	}
-	// Overlapping ranges can produce duplicates. Refill from ranges round-robin.
+
+	expected := len(seeds) + poolTarget
 	attempts := 0
-	for len(ips) < total && attempts < total*20 {
-		r := ranges[attempts%len(ranges)]
+	maxAttempts := expected * 50
+	if maxAttempts < 300 {
+		maxAttempts = 300
+	}
+	for len(ips) < expected && len(pools) > 0 && attempts < maxAttempts {
+		r := pools[attempts%len(pools)]
 		for _, ip := range sampleRange(r, 1, rng) {
 			if !seen[ip] {
 				seen[ip] = true
@@ -209,11 +273,15 @@ func sampleCandidateFile(rawPath, outPath, family string, requested, hardMax int
 		}
 		attempts++
 	}
+
 	if len(ips) == 0 {
 		return 0, allocationNotes, fmt.Errorf("sampling produced no %s candidates", family)
 	}
-	// Randomize cross-range ordering so one range does not always dominate the first workers.
-	rng.Shuffle(len(ips), func(i, j int) { ips[i], ips[j] = ips[j], ips[i] })
+	if len(ips) > len(seeds)+1 {
+		tail := ips[len(seeds):]
+		rng.Shuffle(len(tail), func(i, j int) { tail[i], tail[j] = tail[j], tail[i] })
+	}
+
 	f, err := os.Create(outPath)
 	if err != nil {
 		return 0, allocationNotes, err

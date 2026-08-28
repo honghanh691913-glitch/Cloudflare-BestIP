@@ -1640,6 +1640,32 @@ func normalizeInputEntry(raw, family string) (normalizedInput, bool) {
 	return normalizedInput{}, false
 }
 
+func isSingleHostEntry(v, family string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	if !strings.Contains(v, "/") {
+		ip := net.ParseIP(strings.Trim(v, "[]"))
+		if ip == nil {
+			return false
+		}
+		if family == "ipv4" {
+			return ip.To4() != nil
+		}
+		return ip.To4() == nil
+	}
+	ip, n, err := net.ParseCIDR(v)
+	if err != nil || ip == nil {
+		return false
+	}
+	ones, bits := n.Mask.Size()
+	if family == "ipv4" {
+		return ip.To4() != nil && ones == 32 && bits == 32
+	}
+	return ip.To4() == nil && ones == 128 && bits == 128
+}
+
 func collectInputs(ctx context.Context, s config.Source, outPath string) (int, error) {
 	f, err := os.Create(outPath)
 	if err != nil {
@@ -1649,12 +1675,13 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 
-	seen := map[string]bool{}
+	entries := map[string]bool{}
+	order := make([]string, 0)
 	rawCount := 0
 	decoratedCount := 0
 	invalidCount := 0
 
-	addLine := func(line string) {
+	addLine := func(line string, manual bool) {
 		raw := strings.TrimSpace(line)
 		if raw == "" || strings.HasPrefix(raw, "#") || strings.HasPrefix(raw, ";") {
 			return
@@ -1668,10 +1695,15 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 		if norm.Decorated {
 			decoratedCount++
 		}
-		if !seen[norm.Value] {
-			seen[norm.Value] = true
-			fmt.Fprintln(w, norm.Value)
+		seed := manual && isSingleHostEntry(norm.Value, s.Family)
+		if prev, exists := entries[norm.Value]; exists {
+			if seed && !prev {
+				entries[norm.Value] = true
+			}
+			return
 		}
+		entries[norm.Value] = seed
+		order = append(order, norm.Value)
 	}
 
 	for _, in := range s.Inputs {
@@ -1679,7 +1711,6 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 		if in == "" {
 			continue
 		}
-
 		var r io.ReadCloser
 		if strings.HasPrefix(in, "http://") || strings.HasPrefix(in, "https://") {
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, in, nil)
@@ -1702,18 +1733,17 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 			sc := bufio.NewScanner(strings.NewReader(in))
 			sc.Buffer(make([]byte, 64*1024), 1024*1024)
 			for sc.Scan() {
-				addLine(sc.Text())
+				addLine(sc.Text(), true)
 			}
 			if err := sc.Err(); err != nil {
 				return 0, err
 			}
 			continue
 		}
-
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
 		for sc.Scan() {
-			addLine(sc.Text())
+			addLine(sc.Text(), false)
 		}
 		err = sc.Err()
 		r.Close()
@@ -1722,15 +1752,25 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 		}
 	}
 
-	if len(seen) == 0 {
+	if len(entries) == 0 {
 		return 0, fmt.Errorf(
 			"source %s produced no valid %s inputs (raw=%d invalid=%d); 支持 IP、CIDR、IP:端口#备注、[IPv6]:端口#备注 和 URL",
 			s.ID, s.Family, rawCount, invalidCount,
 		)
 	}
-	log.Printf("[input:%s] normalized raw=%d valid_unique=%d decorated=%d invalid=%d family=%s",
-		s.ID, rawCount, len(seen), decoratedCount, invalidCount, s.Family)
-	return len(seen), nil
+
+	seedCount := 0
+	for _, value := range order {
+		if entries[value] {
+			seedCount++
+			fmt.Fprintln(w, "seed:"+value)
+		} else {
+			fmt.Fprintln(w, value)
+		}
+	}
+	log.Printf("[input:%s] normalized raw=%d valid_unique=%d fixed_seeds=%d decorated=%d invalid=%d family=%s",
+		s.ID, rawCount, len(entries), seedCount, decoratedCount, invalidCount, s.Family)
+	return len(entries), nil
 }
 
 func validForFamily(v, family string) bool {
