@@ -153,7 +153,6 @@ func (c *Client) TriggerUpdate(ctx context.Context, targetName, image string) er
 	if err := c.PullImage(ctx, image); err != nil {
 		return err
 	}
-
 	helperName := fmt.Sprintf("bestip-update-helper-%d", time.Now().Unix())
 	body := map[string]any{
 		"Image": image,
@@ -163,8 +162,8 @@ func (c *Client) TriggerUpdate(ctx context.Context, targetName, image string) er
 			"BESTIP_UPDATE_IMAGE=" + image,
 		},
 		"HostConfig": map[string]any{
-			"Binds":       []string{socketPath + ":" + socketPath},
-			"AutoRemove":  true,
+			"Binds": []string{socketPath + ":" + socketPath},
+			"AutoRemove": true,
 			"NetworkMode": "bridge",
 		},
 	}
@@ -191,7 +190,6 @@ func RunHelper(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Give the initiating HTTP request time to return before the manager is replaced.
 	time.Sleep(2 * time.Second)
 	return c.replaceContainer(ctx, target, image)
 }
@@ -220,13 +218,11 @@ func (c *Client) replaceContainer(ctx context.Context, target, image string) err
 	}
 
 	_ = c.do(ctx, http.MethodPost, "/containers/"+oldID+"/stop?t=10", nil, nil, true)
-
-	// Recreate from the inspected configuration so bind mounts, ports, restart policy,
-	// environment and the Docker socket survive the update.
 	config["Image"] = image
 	delete(config, "Hostname")
 	delete(config, "Domainname")
 	config["HostConfig"] = hostConfig
+
 	var cr createResponse
 	if err := c.do(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(target), config, &cr, true); err != nil {
 		return rollback(fmt.Errorf("创建新版本容器失败: %w", err))
@@ -235,7 +231,6 @@ func (c *Client) replaceContainer(ctx context.Context, target, image string) err
 		_ = c.do(context.Background(), http.MethodDelete, "/containers/"+cr.ID+"?force=true", nil, nil, true)
 		return rollback(fmt.Errorf("启动新版本容器失败: %w", err))
 	}
-	// New container is healthy enough to start; the old stopped backup is no longer needed.
 	_ = c.do(context.Background(), http.MethodDelete, "/containers/"+oldID+"?force=true", nil, nil, true)
 	return nil
 }

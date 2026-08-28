@@ -116,5 +116,6 @@
       "speed_min_mb": 50,
       "auto_rank": true
     }
-  ]
+  ],
+  "real_test_concurrency": 5
 }

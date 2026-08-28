@@ -79,3 +79,17 @@ func TestApplyDefaultsKeepsStandaloneSourcesWhenNoTasks(t *testing.T) {
 		t.Fatalf("standalone source unexpectedly pruned: %#v", c.Sources)
 	}
 }
+
+func TestV072DefaultsRealConcurrencyAndSample256(t *testing.T) {
+	c := Config{
+		Version: 2,
+		Sources: []Source{{ID: "s", Name: "s", Enabled: true, Family: "ipv4", Inputs: []string{"172.64.229.0/24"}}},
+	}
+	ApplyDefaults(&c)
+	if c.RealTestConcurrency != 5 {
+		t.Fatalf("real concurrency=%d want 5", c.RealTestConcurrency)
+	}
+	if c.Sources[0].SampleCount != 256 {
+		t.Fatalf("sample_count=%d want 256", c.Sources[0].SampleCount)
+	}
+}

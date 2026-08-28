@@ -482,40 +482,82 @@ func (m *Manager) filterByRealLink(ctx context.Context, sourceID string, s confi
 		return rows
 	}
 	out := append([]Result(nil), rows...)
-	passed := make([]Result, 0, len(out))
-	total := len(out)
+	indexByIP := make(map[string]int, len(out))
+	ips := make([]string, 0, len(out))
 	for i := range out {
-		if err := ctx.Err(); err != nil {
-			break
-		}
-		latency, err := reallink.MeasureLatency(ctx, *s.RealProfile, out[i].IP, s.GlobalRealTestURL, s.GlobalRealAttempts)
-		out[i].RealTested = true
-		out[i].TestedAt = time.Now()
-		if err != nil {
-			out[i].Qualified = false
-			out[i].RejectReason = "真连接失败：" + compactReason(err.Error())
-			m.logf(sourceID, "REAL %d/%d ip=%s failed=%v", i+1, total, out[i].IP, err)
-		} else {
-			out[i].RealLatencyMS = latency
-			if s.RealLatencyMaxMS > 0 && latency > s.RealLatencyMaxMS {
-				out[i].Qualified = false
-				out[i].RejectReason = fmt.Sprintf("真连接延迟 %.1fms > %.1fms", latency, s.RealLatencyMaxMS)
-				m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms NOT_QUALIFIED", i+1, total, out[i].IP, latency)
-			} else {
-				out[i].Qualified = true
-				out[i].RejectReason = ""
-				passed = append(passed, out[i])
-				m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms QUALIFIED", i+1, total, out[i].IP, latency)
-			}
-		}
-		m.updateHistoryRow(sourceID, out[i])
-		f := m.currentStatus(sourceID).Funnel
-		f.RealTested = i + 1
-		f.RealPassed = len(passed)
-		m.patchFunnel(sourceID, f)
-		m.patchProgress(sourceID, ScanProgress{Phase: "real", Current: i + 1, Total: total, Available: len(passed)})
-		m.setObserved(sourceID, sortRealObserved(out[:i+1], out[i+1:]))
+		indexByIP[out[i].IP] = i
+		ips = append(ips, out[i].IP)
 	}
+
+	passedCount := 0
+	var passMu sync.Mutex
+	_, err := reallink.MeasureLatenciesBatch(
+		ctx, *s.RealProfile, ips, s.GlobalRealTestURL, s.GlobalRealAttempts,
+		s.GlobalRealConcurrency,
+		func(rr reallink.LatencyResult, completed, total int) {
+			i, ok := indexByIP[rr.Candidate]
+			if !ok {
+				return
+			}
+			out[i].RealTested = true
+			out[i].TestedAt = time.Now()
+			if rr.Error != "" {
+				out[i].Qualified = false
+				out[i].RejectReason = "真连接失败：" + compactReason(rr.Error)
+				m.logf(sourceID, "REAL %d/%d ip=%s failed=%s", completed, total, rr.Candidate, rr.Error)
+			} else {
+				out[i].RealLatencyMS = rr.LatencyMS
+				if s.RealLatencyMaxMS > 0 && rr.LatencyMS > s.RealLatencyMaxMS {
+					out[i].Qualified = false
+					out[i].RejectReason = fmt.Sprintf("真连接延迟 %.1fms > %.1fms", rr.LatencyMS, s.RealLatencyMaxMS)
+					m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms NOT_QUALIFIED", completed, total, rr.Candidate, rr.LatencyMS)
+				} else {
+					out[i].Qualified = true
+					out[i].RejectReason = ""
+					passMu.Lock()
+					passedCount++
+					passMu.Unlock()
+					m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms QUALIFIED", completed, total, rr.Candidate, rr.LatencyMS)
+				}
+			}
+			m.updateHistoryRow(sourceID, out[i])
+
+			f := m.currentStatus(sourceID).Funnel
+			f.RealTested = completed
+			passMu.Lock()
+			f.RealPassed = passedCount
+			passMu.Unlock()
+			m.patchFunnel(sourceID, f)
+			m.patchProgress(sourceID, ScanProgress{Phase: "real", Current: completed, Total: total, Available: f.RealPassed})
+
+			done := make([]Result, 0, completed)
+			waiting := make([]Result, 0, total-completed)
+			for _, x := range out {
+				if x.RealTested {
+					done = append(done, x)
+				} else {
+					waiting = append(waiting, x)
+				}
+			}
+			m.setObserved(sourceID, sortRealObserved(done, waiting))
+		},
+	)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.logf(sourceID, "REAL batch warning: %v", err)
+	}
+
+	passed := make([]Result, 0, len(out))
+	for _, row := range out {
+		if row.RealTested && row.Qualified {
+			passed = append(passed, row)
+		}
+	}
+	sort.SliceStable(passed, func(i, j int) bool {
+		if passed[i].RealLatencyMS != passed[j].RealLatencyMS {
+			return passed[i].RealLatencyMS < passed[j].RealLatencyMS
+		}
+		return passed[i].LatencyMS < passed[j].LatencyMS
+	})
 	return passed
 }
 

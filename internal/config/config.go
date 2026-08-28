@@ -30,6 +30,7 @@ type Config struct {
 	FurnaceAutoRank      bool          `json:"furnace_auto_rank"`
 	RealTestURL          string        `json:"real_test_url,omitempty"`
 	RealTestAttempts     int           `json:"real_test_attempts,omitempty"`
+	RealTestConcurrency  int           `json:"real_test_concurrency,omitempty"`
 	RealSpeedURL         string        `json:"real_speed_url,omitempty"`
 	RealSpeedBytesMB     int           `json:"real_speed_bytes_mb,omitempty"`
 	RealSpeedTopN        int           `json:"real_speed_top_n,omitempty"`
@@ -97,15 +98,16 @@ type Source struct {
 	RealSpeedMinMB   float64 `json:"real_speed_min_mb,omitempty"`
 
 	// Runtime-only global fallbacks populated by PrepareSource.
-	GlobalProbeURL      string       `json:"-"`
-	GlobalSpeedURL      string       `json:"-"`
-	GlobalMaxSample     int          `json:"-"`
-	GlobalRealTestURL   string       `json:"-"`
-	GlobalRealAttempts  int          `json:"-"`
-	GlobalRealSpeedURL  string       `json:"-"`
-	GlobalRealSpeedMB   int          `json:"-"`
-	GlobalRealSpeedTopN int          `json:"-"`
-	RealProfile         *RealProfile `json:"-"`
+	GlobalProbeURL        string       `json:"-"`
+	GlobalSpeedURL        string       `json:"-"`
+	GlobalMaxSample       int          `json:"-"`
+	GlobalRealTestURL     string       `json:"-"`
+	GlobalRealAttempts    int          `json:"-"`
+	GlobalRealConcurrency int          `json:"-"`
+	GlobalRealSpeedURL    string       `json:"-"`
+	GlobalRealSpeedMB     int          `json:"-"`
+	GlobalRealSpeedTopN   int          `json:"-"`
+	RealProfile           *RealProfile `json:"-"`
 }
 
 type CFST struct {
@@ -191,6 +193,12 @@ func ApplyDefaults(c *Config) {
 	}
 	if c.RealTestAttempts > 5 {
 		c.RealTestAttempts = 5
+	}
+	if c.RealTestConcurrency <= 0 {
+		c.RealTestConcurrency = 5
+	}
+	if c.RealTestConcurrency > 16 {
+		c.RealTestConcurrency = 16
 	}
 	if strings.TrimSpace(c.RealSpeedURL) == "" {
 		c.RealSpeedURL = c.SpeedURL
@@ -471,6 +479,7 @@ func PrepareSource(c Config, s Source) Source {
 	s.GlobalMaxSample = c.MaxSampleCount
 	s.GlobalRealTestURL = c.RealTestURL
 	s.GlobalRealAttempts = c.RealTestAttempts
+	s.GlobalRealConcurrency = c.RealTestConcurrency
 	s.GlobalRealSpeedURL = c.RealSpeedURL
 	s.GlobalRealSpeedMB = c.RealSpeedBytesMB
 	s.GlobalRealSpeedTopN = c.RealSpeedTopN

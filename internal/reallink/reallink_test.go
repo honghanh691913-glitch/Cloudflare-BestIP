@@ -49,3 +49,28 @@ func TestBuildConfigOverridesOnlyCandidateAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildBatchConfigRoutesEachInboundToMatchingCandidate(t *testing.T) {
+	raw := "vless://a8e1bbcd-aae2-41f4-810f-ac9f20860356@172.64.229.36:443?security=tls&sni=us.755gaoyi.cc.cd&fp=chrome&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query&type=ws&host=us.755gaoyi.cc.cd&path=%2F#NRT-07"
+	p, err := ParseURI(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := BuildBatchConfig(p, []string{"172.64.229.36", "104.16.1.2", "104.16.2.3"}, []int{31001, 31002, 31003})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(cfg)
+	s := string(b)
+	for _, want := range []string{
+		`"tag":"test-out-0"`, `"server":"172.64.229.36"`,
+		`"tag":"test-out-1"`, `"server":"104.16.1.2"`,
+		`"tag":"test-out-2"`, `"server":"104.16.2.3"`,
+		`"inbound":["mixed-1"]`, `"outbound":"test-out-1"`,
+		`"query_server_name":"cloudflare-ech.com"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("missing %s in %s", want, s)
+		}
+	}
+}
