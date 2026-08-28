@@ -23,6 +23,29 @@ type HealthReport struct {
 // requested Colo, and minimum download speed. It intentionally checks only the
 // small active set supplied by the caller rather than rescanning the whole CIDR.
 func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Result) HealthReport {
+	m.runMu.Lock()
+	if m.running[s.ID] {
+		m.runMu.Unlock()
+		return HealthReport{}
+	}
+	m.running[s.ID] = true
+	m.runMu.Unlock()
+	defer func() {
+		m.runMu.Lock()
+		delete(m.running, s.ID)
+		m.runMu.Unlock()
+	}()
+
+	prev := m.currentStatus(s.ID)
+	started := time.Now()
+	m.setStatus(SourceStatus{
+		SourceID: s.ID, Running: true, Stage: "健康检查", StartedAt: started, LastUpdate: started,
+		Results: append([]Result(nil), prev.Results...), Observed: []Result{}, Logs: append([]string(nil), prev.Logs...),
+	})
+	m.patchProgress(s.ID, ScanProgress{Phase: "health", Current: 0, Total: len(current)})
+	m.logf(s.ID, "HEALTH START active=%d thresholds(latency<=%.0fms loss<=%.2f speed>=%.2fMB/s colo=%s)",
+		len(current), s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB, strings.Join(s.CFST.Colo, ","))
+
 	report := HealthReport{Rows: make([]Result, 0, len(current))}
 	for i, old := range current {
 		if err := ctx.Err(); err != nil {
@@ -54,6 +77,11 @@ func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Re
 					r.RejectReason = fmt.Sprintf("健康检查：地区 %s 不匹配 %s", colo, strings.Join(s.CFST.Colo, ","))
 				}
 			}
+		} else if strings.TrimSpace(r.Colo) == "" {
+			// No region restriction: resolve Colo only for display. Failure is not fatal.
+			if colo, err := fetchColo(ctx, s, r.IP); err == nil {
+				r.Colo = colo
+			}
 		}
 		if r.RejectReason == "" {
 			speed, err := measureDownloadSpeed(ctx, s, r.IP)
@@ -72,9 +100,22 @@ func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Re
 			report.Healthy++
 		}
 		report.Rows = append(report.Rows, r)
-		m.logf(s.ID, "HEALTH %d/%d ip=%s healthy=%v latency=%.1fms loss=%.0f%% speed=%.2fMB/s reason=%s",
-			i+1, len(current), r.IP, r.Qualified, r.LatencyMS, r.Loss*100, r.SpeedMB, r.RejectReason)
+		m.setObserved(s.ID, append([]Result(nil), report.Rows...))
+		m.patchProgress(s.ID, ScanProgress{Phase: "health", Current: i + 1, Total: len(current), Available: report.Healthy})
+		m.logf(s.ID, "HEALTH %d/%d ip=%s healthy=%v colo=%s latency=%.1fms loss=%.0f%% speed=%.2fMB/s reason=%s",
+			i+1, len(current), r.IP, r.Qualified, r.Colo, r.LatencyMS, r.Loss*100, r.SpeedMB, r.RejectReason)
 	}
+
+	st := m.currentStatus(s.ID)
+	st.Running = false
+	st.Stage = "健康检查完成"
+	st.EndedAt = time.Now()
+	st.LastUpdate = time.Now()
+	st.Observed = append([]Result(nil), report.Rows...)
+	st.ObservedTotal = len(report.Rows)
+	st.Progress = ScanProgress{Phase: "health", Current: report.Checked, Total: len(current), Available: report.Healthy, Percent: func() int { if len(current)>0 { return report.Checked*100/len(current) }; return 100 }(), StartedAt: started, ElapsedSeconds: int(time.Since(started).Seconds())}
+	m.setStatus(st)
+	m.logf(s.ID, "HEALTH DONE checked=%d healthy=%d/%d elapsed=%s", report.Checked, report.Healthy, len(current), time.Since(started).Round(time.Millisecond))
 	return report
 }
 

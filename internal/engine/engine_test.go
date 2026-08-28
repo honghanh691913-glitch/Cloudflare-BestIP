@@ -149,3 +149,15 @@ func TestMergeResultsPreservesHealthyAndFillsDeficit(t *testing.T) {
 		}
 	}
 }
+
+
+func TestPatchProgressCarriesPhaseTimer(t *testing.T) {
+	m := NewManager()
+	m.patchProgress("p", ScanProgress{Phase:"speed", Current:1, Total:4})
+	time.Sleep(1100 * time.Millisecond)
+	m.patchProgress("p", ScanProgress{Phase:"speed", Current:2, Total:4})
+	p := m.Snapshot()["p"].Progress
+	if p.Percent != 50 { t.Fatalf("percent=%d", p.Percent) }
+	if p.StartedAt.IsZero() || p.ElapsedSeconds < 1 { t.Fatalf("timer not carried: %#v", p) }
+	if p.ETASeconds < 1 { t.Fatalf("eta not computed: %#v", p) }
+}

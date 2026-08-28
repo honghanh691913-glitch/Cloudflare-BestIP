@@ -488,7 +488,7 @@ func (a *App) healthSourceHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, fmt.Errorf("当前没有足够的已选 IP 可做健康检查"))
 		return
 	}
-	go a.runHealthCheck(config.PrepareSource(c, src), required, false)
+	go a.runHealthCheck(config.PrepareSource(c, src), required, true)
 	writeJSON(w, 202, map[string]any{"ok": true})
 }
 
@@ -606,7 +606,7 @@ func (a *App) ingestFurnace(c config.Config, s config.Source, rows []engine.Resu
 	log.Printf("[furnace] source=%s ingested observations=%d", s.ID, len(rows))
 }
 
-func (a *App) runHealthCheck(s config.Source, required int, autoRescan bool) {
+func (a *App) runHealthCheck(s config.Source, required int, autoRefill bool) {
 	if a.Engine.IsRunning(s.ID) {
 		return
 	}
@@ -618,28 +618,58 @@ func (a *App) runHealthCheck(s config.Source, required int, autoRescan bool) {
 	log.Printf("[health] source=%s checking=%d thresholds latency<=%.0fms loss<=%.2f speed>=%.2fMB/s",
 		s.ID, len(current), s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB)
 
+	a.mu.Lock()
+	a.healthStatus[s.ID] = map[string]any{
+		"time": time.Now(), "running": true, "phase": "checking", "ok": false,
+		"checked": 0, "healthy": 0, "required": required,
+		"message": fmt.Sprintf("正在检查当前 DNS 的 %d 个 IP", required),
+	}
+	a.mu.Unlock()
+
 	a.slots <- struct{}{}
-	defer func() { <-a.slots }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
-	defer cancel()
 	report := a.Engine.CheckHealth(ctx, s, current)
+	cancel()
+	<-a.slots
+
 	c := a.Store.Get()
 	a.ingestFurnace(c, s, report.Rows)
-	ok := report.Healthy >= required
+	healthy := make([]engine.Result, 0, required)
+	for _, row := range report.Rows {
+		if row.Qualified {
+			healthy = append(healthy, row)
+		}
+	}
+	ok := len(healthy) >= required
 	if ok {
 		a.Engine.ApplyHealthyRefresh(s.ID, report.Rows)
 	}
 	a.mu.Lock()
 	a.healthStatus[s.ID] = map[string]any{
-		"time": time.Now(), "ok": ok, "checked": report.Checked, "healthy": report.Healthy, "required": required,
+		"time": time.Now(), "running": !ok && autoRefill, "phase": func() string { if ok { return "healthy" }; if autoRefill { return "refill" }; return "degraded" }(),
+		"ok": ok, "checked": report.Checked, "healthy": len(healthy), "required": required,
+		"need": maxServerInt(0, required-len(healthy)), "rows": report.Rows,
 		"message": healthMessage(report, required),
 	}
 	a.lastHealth[s.ID] = time.Now()
 	a.mu.Unlock()
-	log.Printf("[health] source=%s checked=%d healthy=%d required=%d ok=%v", s.ID, report.Checked, report.Healthy, required, ok)
-	if !ok && autoRescan && !a.Engine.IsRunning(s.ID) {
-		log.Printf("[health] source=%s degraded; triggering full strict rescan", s.ID)
-		go a.runAndPublish(s)
+	log.Printf("[health] source=%s checked=%d healthy=%d required=%d ok=%v", s.ID, report.Checked, len(healthy), required, ok)
+
+	if ok || !autoRefill {
+		return
+	}
+	need := required - len(healthy)
+	log.Printf("[health] source=%s degraded; automatic refill need=%d", s.ID, need)
+	if err := a.supplementSource(context.Background(), c, s, healthy, required); err != nil {
+		a.mu.Lock()
+		a.healthStatus[s.ID] = map[string]any{
+			"time": time.Now(), "running": false, "phase": "failed", "ok": false,
+			"checked": report.Checked, "healthy": len(healthy), "required": required, "need": need,
+			"rows": report.Rows, "error": err.Error(),
+			"message": fmt.Sprintf("自动补位失败：%v", err),
+		}
+		a.mu.Unlock()
+		log.Printf("[health] source=%s automatic refill failed: %v", s.ID, err)
 	}
 }
 
@@ -857,6 +887,14 @@ func (a *App) supplementSource(ctx context.Context, c config.Config, s config.So
 	if full <= 0 {
 		full = 256
 	}
+	a.mu.Lock()
+	prevHealth, _ := a.healthStatus[s.ID].(map[string]any)
+	a.healthStatus[s.ID] = map[string]any{
+		"time": time.Now(), "running": true, "phase": "refill", "ok": false,
+		"healthy": len(healthy), "required": required, "need": need,
+		"rows": prevHealth["rows"], "message": fmt.Sprintf("当前 %d/%d 达标，正在自动补 %d 个", len(healthy), required, need),
+	}
+	a.mu.Unlock()
 	sizes := []int{maxServerInt(32, need*24), maxServerInt(64, need*40), maxServerInt(128, need*64), full}
 	tried := map[int]bool{}
 
@@ -876,6 +914,12 @@ func (a *App) supplementSource(ctx context.Context, c config.Config, s config.So
 		ss.SampleCount = n
 		ss.KeepResults = maxServerInt(need*3, need)
 		log.Printf("[startup-health] source=%s supplement attempt sample=%d need=%d", s.ID, n, need)
+		a.mu.Lock()
+		if h, ok := a.healthStatus[s.ID].(map[string]any); ok {
+			h["running"] = true; h["phase"] = "refill"; h["sample"] = n; h["attempt"] = len(tried);
+			h["message"] = fmt.Sprintf("自动补位：缺 %d 个，本轮从 %d 个候选中寻找", need, n)
+		}
+		a.mu.Unlock()
 
 		a.slots <- struct{}{}
 		runCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
@@ -894,6 +938,13 @@ func (a *App) supplementSource(ctx context.Context, c config.Config, s config.So
 		if len(merged) >= required {
 			a.ingestFurnace(c, s, a.Engine.History(s.ID))
 			log.Printf("[startup-health] source=%s refill complete healthy=%d new=%d total=%d", s.ID, len(healthy), required-len(healthy), len(merged))
+			a.mu.Lock()
+			a.healthStatus[s.ID] = map[string]any{
+				"time": time.Now(), "running": false, "phase": "healthy", "ok": true,
+				"healthy": required, "required": required, "need": 0, "rows": merged,
+				"message": fmt.Sprintf("自动补位完成：%d/%d 个在用 IP 达标", required, required),
+			}
+			a.mu.Unlock()
 			// Publish only after a complete set is available.
 			c2 := a.Store.Get()
 			for _, t := range c2.Targets {

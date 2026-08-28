@@ -38,11 +38,14 @@ type Result struct {
 }
 
 type ScanProgress struct {
-	Phase     string `json:"phase,omitempty"`
-	Current   int    `json:"current"`
-	Total     int    `json:"total"`
-	Available int    `json:"available"`
-	Percent   int    `json:"percent"`
+	Phase          string    `json:"phase,omitempty"`
+	Current        int       `json:"current"`
+	Total          int       `json:"total"`
+	Available      int       `json:"available"`
+	Percent        int       `json:"percent"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
+	ElapsedSeconds int       `json:"elapsed_seconds,omitempty"`
+	ETASeconds     int       `json:"eta_seconds,omitempty"`
 }
 
 type FunnelStats struct {
@@ -274,13 +277,14 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	finalists := lossRows
 	if len(s.CFST.Colo) > 0 {
 		m.patchStage(s.ID, "地区筛选")
-		finalists = m.filterByRegion(ctx, s.ID, s, lossRows)
+	} else {
+		m.patchStage(s.ID, "地区识别")
 	}
+	// Even when the task does not restrict Colo, resolve it for finalists as
+	// lightweight informational metadata. This keeps the UI from showing N/A
+	// and costs only one small trace request per finalist, in parallel.
+	finalists = m.filterByRegion(ctx, s.ID, s, lossRows)
 	funnel = m.currentStatus(s.ID).Funnel
-	if len(s.CFST.Colo) == 0 {
-		funnel.RegionPassed = len(finalists)
-		m.patchFunnel(s.ID, funnel)
-	}
 	if len(finalists) == 0 {
 		return m.fail(s.ID, fmt.Errorf("延迟/丢包已通过，但没有 IP 匹配地区 %s", strings.Join(s.CFST.Colo, ",")))
 	}
@@ -440,9 +444,7 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 			wanted[c] = true
 		}
 	}
-	if len(wanted) == 0 {
-		return rows
-	}
+	filtering := len(wanted) > 0
 
 	type item struct {
 		idx int
@@ -472,24 +474,29 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 				r := job.row
 				colo, err := fetchColo(ctx, s, r.IP)
 				r.Colo = colo
-				if err != nil {
-					r.RejectReason = "地区探测失败：" + compactReason(err.Error())
-				} else if wanted[strings.ToUpper(strings.TrimSpace(colo))] {
-					r.RejectReason = "待速度决赛"
+				regionKey := strings.ToUpper(strings.TrimSpace(colo))
+				if filtering {
+					if err != nil {
+						r.RejectReason = "地区探测失败：" + compactReason(err.Error())
+					} else if wanted[regionKey] {
+						r.RejectReason = "待速度决赛"
+					} else {
+						r.RejectReason = fmt.Sprintf("地区 %s 不匹配 %s", colo, strings.Join(s.CFST.Colo, ","))
+					}
 				} else {
-					r.RejectReason = fmt.Sprintf("地区 %s 不匹配 %s", colo, strings.Join(s.CFST.Colo, ","))
+					// Informational-only Colo lookup must never eliminate a candidate.
+					r.RejectReason = "待速度决赛"
 				}
 				m.updateHistoryRow(sourceID, r)
 
 				mu.Lock()
 				done++
-				regionKey := strings.ToUpper(strings.TrimSpace(colo))
 				if err != nil || regionKey == "" {
 					unknownCount++
 				} else {
 					regionCounts[regionKey]++
 				}
-				if err == nil && wanted[regionKey] {
+				if !filtering || (err == nil && wanted[regionKey]) {
 					passed = append(passed, r)
 				}
 				currentDone := done
@@ -545,8 +552,13 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 	if len(parts) == 0 {
 		parts = append(parts, "NONE:0")
 	}
-	m.logf(sourceID, "REGION done matched=%d/%d wanted=%s distribution=%s",
-		len(passed), len(rows), strings.Join(s.CFST.Colo, ","), strings.Join(parts, ","))
+	if filtering {
+		m.logf(sourceID, "REGION done matched=%d/%d wanted=%s distribution=%s",
+			len(passed), len(rows), strings.Join(s.CFST.Colo, ","), strings.Join(parts, ","))
+	} else {
+		m.logf(sourceID, "REGION info resolved=%d/%d distribution=%s",
+			len(rows)-unknownCount, len(rows), strings.Join(parts, ","))
+	}
 	return passed
 }
 
@@ -946,16 +958,33 @@ func (m *Manager) updateHistoryRowSlice(rows []Result, ip string, fn func(*Resul
 }
 
 func (m *Manager) patchProgress(id string, p ScanProgress) {
+	now := time.Now()
+	m.mu.Lock()
+	st := m.status[id]
+	prev := st.Progress
 	if p.Total > 0 {
 		p.Percent = p.Current * 100 / p.Total
 		if p.Percent > 100 {
 			p.Percent = 100
 		}
 	}
-	m.mu.Lock()
-	st := m.status[id]
+	if p.StartedAt.IsZero() {
+		if prev.Phase == p.Phase && !prev.StartedAt.IsZero() {
+			p.StartedAt = prev.StartedAt
+		} else {
+			p.StartedAt = now
+		}
+	}
+	if !p.StartedAt.IsZero() {
+		elapsed := int(now.Sub(p.StartedAt).Seconds())
+		if elapsed < 0 { elapsed = 0 }
+		p.ElapsedSeconds = elapsed
+		if p.Current > 0 && p.Total > p.Current && elapsed > 0 {
+			p.ETASeconds = int(float64(elapsed) * float64(p.Total-p.Current) / float64(p.Current))
+		}
+	}
 	st.Progress = p
-	st.LastUpdate = time.Now()
+	st.LastUpdate = now
 	m.status[id] = st
 	m.mu.Unlock()
 }
@@ -1114,9 +1143,6 @@ func (w *cfstStream) consume(raw string) {
 			available, _ = strconv.Atoi(a[1])
 		}
 		p := ScanProgress{Phase: w.phase, Current: cur, Total: total, Available: available}
-		if stage != "" {
-			p.Phase = stage
-		}
 		w.m.patchProgress(w.sourceID, p)
 		pct := 0
 		if total > 0 {
