@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -30,6 +31,62 @@ type cfRecord struct {
 	Type    string `json:"type"`
 	Name    string `json:"name"`
 	Content string `json:"content"`
+}
+
+
+// ListTargetRecords reads the records currently published for a target.
+// Startup recovery uses this instead of assuming an empty in-memory engine
+// means the active DNS IPs are invalid.
+func (c CloudflareClient) ListTargetRecords(ctx context.Context, p config.Provider, t config.Target) (map[string][]string, error) {
+	if p.Type != "cloudflare" {
+		return nil, fmt.Errorf("unsupported provider type: %s", p.Type)
+	}
+	if strings.TrimSpace(p.ZoneID) == "" {
+		return nil, fmt.Errorf("provider %s missing zone_id", p.ID)
+	}
+	hostname := config.TargetHostname(p, t)
+	if hostname == "" {
+		return nil, fmt.Errorf("target %s has no resolvable hostname", t.ID)
+	}
+
+	out := map[string][]string{"A": {}, "AAAA": {}}
+	base := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", p.ZoneID)
+	for _, typ := range []string{"A", "AAAA"} {
+		q := url.Values{}
+		q.Set("type", typ)
+		q.Set("name", hostname)
+		q.Set("per_page", "100")
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"?"+q.Encode(), nil)
+		applyCloudflareAuth(req, p)
+		resp, err := client(c.HTTP).Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var got cfResponse[[]cfRecord]
+		err = json.NewDecoder(resp.Body).Decode(&got)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if !got.Success {
+			return nil, cloudflareProviderError(p, cfErr(got.Errors))
+		}
+		for _, rec := range got.Result {
+			ip := strings.TrimSpace(rec.Content)
+			if ip == "" {
+				continue
+			}
+			if typ == "A" && net.ParseIP(ip) != nil && net.ParseIP(ip).To4() != nil {
+				out[typ] = append(out[typ], ip)
+			}
+			if typ == "AAAA" && net.ParseIP(ip) != nil && net.ParseIP(ip).To4() == nil {
+				out[typ] = append(out[typ], ip)
+			}
+		}
+		out[typ] = unique(out[typ])
+		sort.Strings(out[typ])
+	}
+	return out, nil
 }
 
 func (c CloudflareClient) SyncTarget(ctx context.Context, p config.Provider, t config.Target, latest map[string][]engine.Result) error {

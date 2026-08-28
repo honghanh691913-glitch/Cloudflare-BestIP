@@ -117,3 +117,35 @@ func TestCFSTStreamUpdatesProgress(t *testing.T) {
 		t.Fatalf("unexpected progress: %+v", st.Progress)
 	}
 }
+
+
+func TestMergeResultsPreservesHealthyAndFillsDeficit(t *testing.T) {
+	m := NewManager()
+	healthy := []Result{
+		{IP:"1.1.1.1", Family:"ipv4", SpeedMB:60, LatencyMS:20, Qualified:true, SpeedTested:true},
+		{IP:"1.1.1.2", Family:"ipv4", SpeedMB:55, LatencyMS:22, Qualified:true, SpeedTested:true},
+		{IP:"1.1.1.3", Family:"ipv4", SpeedMB:50, LatencyMS:25, Qualified:true, SpeedTested:true},
+	}
+	supp := []Result{
+		{IP:"1.1.1.2", Family:"ipv4", SpeedMB:80, LatencyMS:18, Qualified:true, SpeedTested:true}, // duplicate
+		{IP:"1.1.1.4", Family:"ipv4", SpeedMB:70, LatencyMS:19, Qualified:true, SpeedTested:true},
+		{IP:"1.1.1.5", Family:"ipv4", SpeedMB:65, LatencyMS:21, Qualified:true, SpeedTested:true},
+		{IP:"1.1.1.6", Family:"ipv4", SpeedMB:90, LatencyMS:15, Qualified:false, SpeedTested:true}, // reject
+	}
+	got := m.MergeResults("s1", healthy, supp, 5)
+	if len(got) != 5 {
+		t.Fatalf("got %d results, want 5: %#v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, r := range got {
+		if seen[r.IP] {
+			t.Fatalf("duplicate IP %s", r.IP)
+		}
+		seen[r.IP] = true
+	}
+	for _, ip := range []string{"1.1.1.1","1.1.1.2","1.1.1.3","1.1.1.4","1.1.1.5"} {
+		if !seen[ip] {
+			t.Fatalf("missing %s in %#v", ip, got)
+		}
+	}
+}

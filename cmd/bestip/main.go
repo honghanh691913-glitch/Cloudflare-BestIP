@@ -51,6 +51,7 @@ func main() {
 	defer cancel()
 	log.Printf("[startup] BestIP Manager version=%s commit=%s listen=%s config=%s sources=%d targets=%d providers=%d concurrency=%d web_update=%v",
 		buildinfo.Version, short(buildinfo.Commit), cfg.Listen, cfgPath, len(cfg.Sources), len(cfg.Targets), len(cfg.Providers), cfg.MaxConcurrency, updater.Available())
+	go app.BootstrapActiveDNS(ctx)
 	go app.Scheduler(ctx)
 	go func() {
 		log.Printf("[startup] HTTP server listening on %s", cfg.Listen)

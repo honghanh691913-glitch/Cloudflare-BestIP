@@ -707,10 +707,235 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	return err
 }
 
+
+// BootstrapActiveDNS runs once after container start/update.
+// It validates the IPs that are already published in DNS and only fills
+// missing/unhealthy slots. A restart itself must never trigger a full strict scan.
+func (a *App) BootstrapActiveDNS(ctx context.Context) {
+	time.Sleep(2 * time.Second)
+	c := a.Store.Get()
+	log.Printf("[startup-health] begin targets=%d sources=%d", len(c.Targets), len(c.Sources))
+
+	// Collect the currently-published IPs per source. Target refs are assigned
+	// records of the matching family in declaration order.
+	currentBySource := map[string][]engine.Result{}
+	for _, t := range c.Targets {
+		if !t.Enabled {
+			continue
+		}
+		var p *config.Provider
+		for i := range c.Providers {
+			if c.Providers[i].ID == t.ProviderID {
+				p = &c.Providers[i]
+				break
+			}
+		}
+		if p == nil {
+			log.Printf("[startup-health] target=%s skipped: provider not found", t.ID)
+			continue
+		}
+		readCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		recs, err := a.dns.ListTargetRecords(readCtx, *p, t)
+		cancel()
+		if err != nil {
+			log.Printf("[startup-health] target=%s DNS read failed: %v", t.ID, err)
+			continue
+		}
+		pos := map[string]int{"A": 0, "AAAA": 0}
+		for _, ref := range t.Sources {
+			s, ok := sourceByID(c, ref.SourceID)
+			if !ok || ref.Count <= 0 {
+				continue
+			}
+			typ := "A"
+			if s.Family == "ipv6" {
+				typ = "AAAA"
+			}
+			start := pos[typ]
+			end := start + ref.Count
+			if end > len(recs[typ]) {
+				end = len(recs[typ])
+			}
+			for _, ip := range recs[typ][start:end] {
+				currentBySource[s.ID] = append(currentBySource[s.ID], engine.Result{
+					IP: ip, Family: s.Family, Qualified: true,
+				})
+			}
+			pos[typ] = end
+		}
+	}
+
+	// Validate each enabled source's active set.
+	for _, raw := range c.Sources {
+		if !raw.Enabled {
+			continue
+		}
+		s := config.PrepareSource(c, raw)
+		required := requiredCountForSource(c, s.ID)
+		if required < 1 {
+			continue
+		}
+		current := uniqueResultIPs(currentBySource[s.ID])
+		if len(current) > required {
+			current = current[:required]
+		}
+
+		if len(current) > 0 {
+			log.Printf("[startup-health] source=%s checking active DNS %d/%d", s.ID, len(current), required)
+			a.slots <- struct{}{}
+			checkCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+			report := a.Engine.CheckHealth(checkCtx, s, current)
+			cancel()
+			<-a.slots
+
+			healthy := make([]engine.Result, 0, required)
+			for _, r := range report.Rows {
+				if r.Qualified {
+					healthy = append(healthy, r)
+				}
+			}
+			a.ingestFurnace(c, s, report.Rows)
+			a.markHealthTime(s.ID, time.Now())
+
+			a.mu.Lock()
+			a.healthStatus[s.ID] = map[string]any{
+				"time": time.Now(), "ok": len(healthy) >= required,
+				"checked": report.Checked, "healthy": len(healthy), "required": required,
+				"message": fmt.Sprintf("启动恢复：%d/%d 个当前 DNS IP 达标", len(healthy), required),
+			}
+			a.mu.Unlock()
+
+			if len(healthy) >= required {
+				a.Engine.SeedResults(s.ID, healthy[:required], "启动健康检查通过")
+				log.Printf("[startup-health] source=%s all healthy=%d/%d; full scan skipped", s.ID, required, required)
+				continue
+			}
+
+			need := required - len(healthy)
+			log.Printf("[startup-health] source=%s degraded healthy=%d/%d need=%d; supplemental fill", s.ID, len(healthy), required, need)
+			if err := a.supplementSource(ctx, c, s, healthy, required); err != nil {
+				log.Printf("[startup-health] source=%s supplemental fill failed: %v", s.ID, err)
+				// Keep healthy survivors in memory even if refill cannot finish.
+				if len(healthy) > 0 {
+					a.Engine.SeedResults(s.ID, healthy, "启动检查：等待补位")
+				}
+			}
+			continue
+		}
+
+		// No active DNS record was readable. Do not immediately full-scan just
+		// because the process restarted; wait for the normal interval or manual run.
+		log.Printf("[startup-health] source=%s no active DNS records found; startup full scan skipped", s.ID)
+	}
+	log.Printf("[startup-health] complete")
+}
+
+func uniqueResultIPs(in []engine.Result) []engine.Result {
+	seen := map[string]bool{}
+	out := make([]engine.Result, 0, len(in))
+	for _, r := range in {
+		ip := strings.TrimSpace(r.IP)
+		if ip == "" || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+// supplementSource preserves the currently healthy active set and searches only
+// for the deficit. It starts with a small candidate sample and expands only when
+// necessary, instead of jumping straight to the source's full 256/large sample.
+func (a *App) supplementSource(ctx context.Context, c config.Config, s config.Source, healthy []engine.Result, required int) error {
+	need := required - len(healthy)
+	if need <= 0 {
+		a.Engine.SeedResults(s.ID, healthy, "启动健康检查通过")
+		return nil
+	}
+	full := s.SampleCount
+	if full <= 0 {
+		full = 256
+	}
+	sizes := []int{maxServerInt(32, need*24), maxServerInt(64, need*40), maxServerInt(128, need*64), full}
+	tried := map[int]bool{}
+
+	for _, n := range sizes {
+		if n > full {
+			n = full
+		}
+		if n < need {
+			n = need
+		}
+		if tried[n] {
+			continue
+		}
+		tried[n] = true
+
+		ss := s
+		ss.SampleCount = n
+		ss.KeepResults = maxServerInt(need*3, need)
+		log.Printf("[startup-health] source=%s supplement attempt sample=%d need=%d", s.ID, n, need)
+
+		a.slots <- struct{}{}
+		runCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		err := a.Engine.RunSource(runCtx, ss)
+		cancel()
+		<-a.slots
+		if err != nil {
+			log.Printf("[startup-health] source=%s supplement sample=%d failed: %v", s.ID, n, err)
+			if n >= full {
+				return err
+			}
+			continue
+		}
+		supplemental := a.Engine.Latest(s.ID)
+		merged := a.Engine.MergeResults(s.ID, healthy, supplemental, required)
+		if len(merged) >= required {
+			a.ingestFurnace(c, s, a.Engine.History(s.ID))
+			log.Printf("[startup-health] source=%s refill complete healthy=%d new=%d total=%d", s.ID, len(healthy), required-len(healthy), len(merged))
+			// Publish only after a complete set is available.
+			c2 := a.Store.Get()
+			for _, t := range c2.Targets {
+				if !t.Enabled {
+					continue
+				}
+				for _, ref := range t.Sources {
+					if ref.SourceID == s.ID {
+						_ = a.syncTarget(context.Background(), t.ID)
+						break
+					}
+				}
+			}
+			return nil
+		}
+		if n >= full {
+			break
+		}
+	}
+	return fmt.Errorf("补位未找到足够达标 IP：当前 %d/%d", len(a.Engine.Latest(s.ID)), required)
+}
+
+func maxServerInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (a *App) Scheduler(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	// A process/container restart is not a reason to perform a full strict scan.
+	// Start the periodic interval from this process start; BootstrapActiveDNS
+	// separately validates the currently published IPs and fills only deficits.
 	lastScan := map[string]time.Time{}
+	startedAt := time.Now()
+	for _, s := range a.Store.Get().Sources {
+		if s.Enabled {
+			lastScan[s.ID] = startedAt
+		}
+	}
 	lastPeriod := furnace.PeriodName(time.Now())
 	for {
 		select {

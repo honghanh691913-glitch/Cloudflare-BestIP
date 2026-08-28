@@ -164,3 +164,72 @@ func (m *Manager) ApplyHealthyRefresh(sourceID string, rows []Result) bool {
 	m.status[sourceID] = st
 	return true
 }
+
+
+// SeedResults hydrates the in-memory source state from records that already
+// exist in DNS and have just passed a fresh health check.
+func (m *Manager) SeedResults(sourceID string, rows []Result, stage string) {
+	if len(rows) == 0 {
+		return
+	}
+	out := append([]Result(nil), rows...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].SpeedMB == out[j].SpeedMB {
+			return out[i].LatencyMS < out[j].LatencyMS
+		}
+		return out[i].SpeedMB > out[j].SpeedMB
+	})
+	now := time.Now()
+	m.mu.Lock()
+	st := m.status[sourceID]
+	st.SourceID = sourceID
+	st.Running = false
+	if strings.TrimSpace(stage) == "" {
+		stage = "启动恢复完成"
+	}
+	st.Stage = stage
+	st.Error = ""
+	st.Results = out
+	st.Observed = append([]Result(nil), out...)
+	st.ObservedTotal = len(out)
+	st.LastUpdate = now
+	st.EndedAt = now
+	st.Progress = ScanProgress{Phase: "health", Current: len(out), Total: len(out), Available: len(out), Percent: 100}
+	m.status[sourceID] = st
+	m.mu.Unlock()
+}
+
+// MergeResults keeps already-healthy active IPs and fills only missing slots
+// from a supplemental strict scan. Duplicates are removed and the final active
+// set is ranked by current speed, then latency.
+func (m *Manager) MergeResults(sourceID string, healthy, supplemental []Result, required int) []Result {
+	if required < 1 {
+		required = len(healthy)
+	}
+	seen := map[string]bool{}
+	merged := make([]Result, 0, required)
+	add := func(rows []Result) {
+		for _, r := range rows {
+			if !r.Qualified || strings.TrimSpace(r.IP) == "" || seen[r.IP] {
+				continue
+			}
+			seen[r.IP] = true
+			merged = append(merged, r)
+		}
+	}
+	add(healthy)
+	add(supplemental)
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].SpeedMB == merged[j].SpeedMB {
+			return merged[i].LatencyMS < merged[j].LatencyMS
+		}
+		return merged[i].SpeedMB > merged[j].SpeedMB
+	})
+	if len(merged) > required {
+		merged = merged[:required]
+	}
+	if len(merged) > 0 {
+		m.SeedResults(sourceID, merged, "启动补位完成")
+	}
+	return merged
+}
