@@ -133,6 +133,40 @@ func (c CloudflareClient) SyncTarget(ctx context.Context, p config.Provider, t c
 	return nil
 }
 
+
+type reconcilePlan struct {
+	Keep    []cfRecord
+	Extras  []cfRecord
+	Missing []string
+}
+
+func planRecordReconcile(records []cfRecord, want []string) reconcilePlan {
+	want = unique(want)
+	sort.Strings(want)
+
+	wanted := map[string]bool{}
+	for _, ip := range want {
+		wanted[ip] = true
+	}
+	keptSet := map[string]bool{}
+	plan := reconcilePlan{}
+	for _, rec := range records {
+		ip := strings.TrimSpace(rec.Content)
+		if wanted[ip] && !keptSet[ip] {
+			keptSet[ip] = true
+			plan.Keep = append(plan.Keep, rec)
+			continue
+		}
+		plan.Extras = append(plan.Extras, rec)
+	}
+	for _, ip := range want {
+		if !keptSet[ip] {
+			plan.Missing = append(plan.Missing, ip)
+		}
+	}
+	return plan
+}
+
 func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t config.Target, typ string, want []string) error {
 	hostname := config.TargetHostname(p, t)
 	if hostname == "" {
@@ -158,28 +192,38 @@ func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t con
 		return cloudflareProviderError(p, cfErr(got.Errors))
 	}
 
-	sort.Strings(want)
-	records := got.Result
-	// Reuse existing records by slot, then delete extras and create missing.
-	common := len(records)
-	if len(want) < common {
-		common = len(want)
+	// Reconcile by record content rather than by list position.
+	//
+	// Slot-by-slot PUT is unsafe with Cloudflare. Example:
+	// existing = [1,2,3,4,5], desired = [2,3,4,5,6].
+	// Updating the first record 1 -> 2 collides with the already-existing "2"
+	// and Cloudflare returns 81058 "An identical record already exists".
+	//
+	// Instead:
+	//   1) keep records whose content is still desired;
+	//   2) reuse genuinely-extra records for genuinely-missing contents;
+	//   3) delete remaining extras;
+	//   4) create remaining missing records.
+	plan := planRecordReconcile(got.Result, want)
+	extras := plan.Extras
+	missing := plan.Missing
+
+	// Reuse extras first. Every item in missing is guaranteed not to already
+	// exist among the kept records, so these PUTs cannot trigger 81058 merely
+	// because another desired record already has the same content.
+	reuse := len(extras)
+	if len(missing) < reuse {
+		reuse = len(missing)
 	}
-	for i := 0; i < common; i++ {
-		if records[i].Content == want[i] {
-			continue
-		}
-		if err := c.write(ctx, p, t, typ, records[i].ID, want[i], http.MethodPut); err != nil {
-			return err
+	for i := 0; i < reuse; i++ {
+		if err := c.write(ctx, p, t, typ, extras[i].ID, missing[i], http.MethodPut); err != nil {
+			return fmt.Errorf("reconcile %s %s: %w", typ, hostname, err)
 		}
 	}
-	for i := common; i < len(want); i++ {
-		if err := c.write(ctx, p, t, typ, "", want[i], http.MethodPost); err != nil {
-			return err
-		}
-	}
-	for i := common; i < len(records); i++ {
-		u := base + "/" + records[i].ID
+
+	// Delete extras that were not reused.
+	for i := reuse; i < len(extras); i++ {
+		u := base + "/" + extras[i].ID
 		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
 		applyCloudflareAuth(req, p)
 		resp, err := client(c.HTTP).Do(req)
@@ -190,6 +234,13 @@ func (c CloudflareClient) syncType(ctx context.Context, p config.Provider, t con
 		resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return fmt.Errorf("delete %s %s: %s", typ, hostname, resp.Status)
+		}
+	}
+
+	// Create missing records that had no extra slot available.
+	for i := reuse; i < len(missing); i++ {
+		if err := c.write(ctx, p, t, typ, "", missing[i], http.MethodPost); err != nil {
+			return fmt.Errorf("create %s %s %s: %w", typ, hostname, missing[i], err)
 		}
 	}
 	return nil
