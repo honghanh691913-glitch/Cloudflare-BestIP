@@ -452,6 +452,8 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	passed := make([]Result, 0, len(rows))
+	regionCounts := map[string]int{}
+	unknownCount := 0
 	done := 0
 
 	workers := 64
@@ -481,7 +483,13 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 
 				mu.Lock()
 				done++
-				if err == nil && wanted[strings.ToUpper(strings.TrimSpace(colo))] {
+				regionKey := strings.ToUpper(strings.TrimSpace(colo))
+				if err != nil || regionKey == "" {
+					unknownCount++
+				} else {
+					regionCounts[regionKey]++
+				}
+				if err == nil && wanted[regionKey] {
 					passed = append(passed, r)
 				}
 				currentDone := done
@@ -522,7 +530,23 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 	funnel.RegionPassed = len(passed)
 	m.patchFunnel(sourceID, funnel)
 	m.setObserved(sourceID, passed)
-	m.logf(sourceID, "REGION done matched=%d/%d wanted=%s", len(passed), len(rows), strings.Join(s.CFST.Colo, ","))
+	keys := make([]string, 0, len(regionCounts))
+	for k := range regionCounts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys)+1)
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", k, regionCounts[k]))
+	}
+	if unknownCount > 0 {
+		parts = append(parts, fmt.Sprintf("UNKNOWN:%d", unknownCount))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "NONE:0")
+	}
+	m.logf(sourceID, "REGION done matched=%d/%d wanted=%s distribution=%s",
+		len(passed), len(rows), strings.Join(s.CFST.Colo, ","), strings.Join(parts, ","))
 	return passed
 }
 
@@ -558,24 +582,56 @@ func normalizeHTTPURL(v, scheme string) string {
 }
 
 func fetchColo(ctx context.Context, s config.Source, ip string) (string, error) {
-	raw := effectiveProbeURL(s)
-	if raw == "" {
-		raw = config.DefaultProbeURL
+	rawCandidates := []string{}
+	if raw := strings.TrimSpace(effectiveProbeURL(s)); raw != "" {
+		rawCandidates = append(rawCandidates, raw)
 	}
+	rawCandidates = append(rawCandidates,
+		"https://speed.cloudflare.com/cdn-cgi/trace",
+		"https://www.cloudflare.com/cdn-cgi/trace",
+	)
+
+	seen := map[string]bool{}
+	errs := make([]string, 0, len(rawCandidates))
+	for _, raw := range rawCandidates {
+		raw = normalizeHTTPURL(raw, "https")
+		if raw == "" || seen[raw] {
+			continue
+		}
+		seen[raw] = true
+		colo, err := fetchColoAt(ctx, ip, raw, s.CFST.Port)
+		if err == nil && colo != "" {
+			return colo, nil
+		}
+		if err != nil {
+			errs = append(errs, compactReason(err.Error()))
+		}
+	}
+	if len(errs) == 0 {
+		return "", fmt.Errorf("地区探测未取得 Colo")
+	}
+	if len(errs) > 3 {
+		errs = errs[:3]
+	}
+	return "", fmt.Errorf("地区探测未取得 Colo：%s", strings.Join(errs, " | "))
+}
+
+func fetchColoAt(ctx context.Context, ip, raw string, defaultPort int) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" {
-		return "", fmt.Errorf("invalid speed URL")
+		return "", fmt.Errorf("invalid probe URL %q", raw)
 	}
-	host := u.Hostname()
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		scheme = "https"
+		return "", fmt.Errorf("probe URL must use http/https")
 	}
-	port := s.CFST.Port
-	if port <= 0 {
-		if p := u.Port(); p != "" {
-			port, _ = strconv.Atoi(p)
-		}
+
+	port := 0
+	if p := u.Port(); p != "" {
+		port, _ = strconv.Atoi(p)
+	}
+	if port <= 0 && defaultPort > 0 {
+		port = defaultPort
 	}
 	if port <= 0 {
 		if scheme == "https" {
@@ -585,41 +641,44 @@ func fetchColo(ctx context.Context, s config.Source, ip string) (string, error) 
 		}
 	}
 
-	traceURL := u.String()
-	client := boundHTTPClient(ip, port, host, 2500*time.Millisecond)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, traceURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	client := boundHTTPClient(ip, port, u.Hostname(), 3500*time.Millisecond)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "BestIP-Manager/colo")
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := client.Do(req)
 	if err != nil {
-		// A custom speed host may have unusual routing. Fall back to the canonical
-		// Cloudflare trace host while keeping the same edge IP.
-		fallback := "https://speed.cloudflare.com/cdn-cgi/trace"
-		client = boundHTTPClient(ip, 443, "speed.cloudflare.com", 2500*time.Millisecond)
-		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, fallback, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-		resp, err = client.Do(req)
-		if err != nil {
-			return "", err
-		}
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return "", fmt.Errorf("trace HTTP %s", resp.Status)
+		return "", fmt.Errorf("%s HTTP %s", u.Hostname(), resp.Status)
 	}
+
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	if err != nil {
 		return "", err
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "colo=") {
-			colo := strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(line, "colo=")))
-			if colo != "" {
+		if strings.HasPrefix(strings.ToLower(line), "colo=") {
+			colo := strings.ToUpper(strings.TrimSpace(line[strings.Index(line, "=")+1:]))
+			if len(colo) == 3 {
 				return colo, nil
 			}
 		}
 	}
-	return "", fmt.Errorf("trace did not return colo")
+	if ray := strings.TrimSpace(resp.Header.Get("CF-Ray")); ray != "" {
+		if i := strings.LastIndex(ray, "-"); i >= 0 && i+1 < len(ray) {
+			colo := strings.ToUpper(strings.TrimSpace(ray[i+1:]))
+			if len(colo) == 3 {
+				return colo, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("%s 未返回 colo/CF-Ray", u.Hostname())
 }
 
 func measureDownloadSpeed(ctx context.Context, s config.Source, ip string) (float64, error) {
@@ -1098,12 +1157,10 @@ func buildProbeArgs(s config.Source, inputFile, outFile string) []string {
 	if c.Port > 0 {
 		args = append(args, "-tp", strconv.Itoa(c.Port))
 	}
-	if c.HTTPing && len(c.Colo) == 0 {
-		if u := effectiveProbeURL(s); u != "" {
-			args = append(args, "-url", u)
-		}
-		args = append(args, "-httping")
-	}
+	// v0.6.1: fast latency/loss pre-scan is always TCPing.
+	// HTTPing can create false negatives when an HTTP Host/SNI is forced onto
+	// arbitrary candidate IPs, so region detection is handled separately.
+	// Do not pass -url or -httping here, even for legacy httping=true configs.
 	// Deliberately omit -tl/-tll/-tlr/-sl/-cfcolo so the pre-scan preserves
 	// responsive IPs that later fail user thresholds.
 	return args

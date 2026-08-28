@@ -38,6 +38,24 @@ func TestBuildProbeArgsIsLightweightAndExactCandidates(t *testing.T) {
 	}
 }
 
+
+func TestBuildProbeArgsForcesTCPEvenWhenLegacyHTTPingEnabled(t *testing.T) {
+	s := config.Source{
+		Family: "ipv4",
+		CFST: config.CFST{
+			Threads: 200,
+			PingCount: 4,
+			Port: 443,
+			HTTPing: true,
+			ProbeURL: "https://speed.cloudflare.com/cdn-cgi/trace",
+		},
+	}
+	joined := strings.Join(buildProbeArgs(s, "/tmp/in.txt", "/tmp/probe.csv"), " ")
+	if strings.Contains(joined, "-httping") || strings.Contains(joined, "-url ") {
+		t.Fatalf("pre-scan must be TCP only even for legacy httping=true: %s", joined)
+	}
+}
+
 func TestSortObservedPinsQualifiedBySpeed(t *testing.T) {
 	rows := []Result{
 		{IP: "pending", LatencyMS: 20},
