@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -144,22 +145,88 @@ func latestMainCommit(ctx context.Context) (githubCommit, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "BestIP-Manager/"+buildinfo.Version)
-	client := &http.Client{Timeout: 12 * time.Second}
+	client := &http.Client{Timeout: 6 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return out, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return out, fmt.Errorf("GitHub 返回 %s", resp.Status)
+		return out, fmt.Errorf("GitHub API 返回 %s", resp.Status)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return out, err
 	}
 	if out.SHA == "" {
-		return out, fmt.Errorf("GitHub 未返回 main 提交号")
+		return out, fmt.Errorf("GitHub API 未返回 main 提交号")
 	}
 	return out, nil
+}
+
+type remoteVersion struct {
+	Version string
+	Source  string
+	URL     string
+}
+
+func fetchPlainVersion(ctx context.Context, rawURL, source string) (remoteVersion, error) {
+	var out remoteVersion
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("User-Agent", "BestIP-Manager/"+buildinfo.Version)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, fmt.Errorf("%s 返回 %s", source, resp.Status)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+	if err != nil {
+		return out, err
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" || len(v) > 64 || !strings.HasPrefix(strings.ToLower(v), "v") {
+		return out, fmt.Errorf("%s VERSION 内容无效", source)
+	}
+	return remoteVersion{Version: v, Source: source, URL: rawURL}, nil
+}
+
+func latestVersionFallback(ctx context.Context) (remoteVersion, []string) {
+	urls := []struct {
+		url    string
+		source string
+	}{
+		{"https://raw.githubusercontent.com/" + buildinfo.Repository + "/main/VERSION", "GitHub Raw"},
+		{"https://cdn.jsdelivr.net/gh/" + buildinfo.Repository + "@main/VERSION", "jsDelivr"},
+	}
+	errs := []string{}
+	for _, x := range urls {
+		child, cancel := context.WithTimeout(ctx, 5*time.Second)
+		v, err := fetchPlainVersion(child, x.url, x.source)
+		cancel()
+		if err == nil {
+			return v, errs
+		}
+		errs = append(errs, x.source+": "+compactUpdateError(err))
+	}
+	return remoteVersion{}, errs
+}
+
+func compactUpdateError(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := strings.TrimSpace(strings.ReplaceAll(err.Error(), "\n", " "))
+	if len([]rune(s)) > 180 {
+		r := []rune(s)
+		s = string(r[:180]) + "…"
+	}
+	return s
 }
 
 func (a *App) updateCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -167,20 +234,54 @@ func (a *App) updateCheckHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
 	defer cancel()
-	latest, err := latestMainCommit(ctx)
-	if err != nil {
-		writeErr(w, 502, fmt.Errorf("检查更新失败: %w", err))
+
+	currentCommit := strings.TrimSpace(buildinfo.Commit)
+	currentVersion := strings.TrimSpace(buildinfo.Version)
+
+	apiCtx, apiCancel := context.WithTimeout(ctx, 6*time.Second)
+	latest, apiErr := latestMainCommit(apiCtx)
+	apiCancel()
+	if apiErr == nil {
+		available := currentCommit == "" || currentCommit == "unknown" || !strings.EqualFold(currentCommit, latest.SHA)
+		writeJSON(w, 200, map[string]any{
+			"current":          buildPayload(),
+			"check_ok":         true,
+			"check_source":     "GitHub API",
+			"latest_commit":    latest.SHA,
+			"latest_url":       latest.HTMLURL,
+			"update_available": available,
+			"can_force_update": updater.Available(),
+		})
 		return
 	}
-	current := strings.TrimSpace(buildinfo.Commit)
-	available := current == "" || current == "unknown" || !strings.EqualFold(current, latest.SHA)
+
+	fallback, fallbackErrs := latestVersionFallback(ctx)
+	if fallback.Version != "" {
+		available := currentVersion == "" || currentVersion == "dev" || currentVersion == "unknown" || !strings.EqualFold(currentVersion, fallback.Version)
+		writeJSON(w, 200, map[string]any{
+			"current":          buildPayload(),
+			"check_ok":         true,
+			"check_source":     fallback.Source,
+			"latest_version":   fallback.Version,
+			"latest_url":       fallback.URL,
+			"update_available": available,
+			"can_force_update": updater.Available(),
+			"check_warning":    "GitHub API 不可达，已改用 VERSION 备用通道；Commit 无法精确比较",
+			"api_error":        compactUpdateError(apiErr),
+		})
+		return
+	}
+
+	allErrs := append([]string{"GitHub API: " + compactUpdateError(apiErr)}, fallbackErrs...)
 	writeJSON(w, 200, map[string]any{
 		"current":          buildPayload(),
-		"latest_commit":    latest.SHA,
-		"latest_url":       latest.HTMLURL,
-		"update_available": available,
+		"check_ok":         false,
+		"check_source":     "unavailable",
+		"update_available": false,
+		"can_force_update": updater.Available(),
+		"check_error":      strings.Join(allErrs, " | "),
 	})
 }
 
