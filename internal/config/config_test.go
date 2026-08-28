@@ -36,3 +36,11 @@ func TestCloudflareAuthMode(t *testing.T) {
 		t.Fatalf("legacy mode = %s", got)
 	}
 }
+
+func TestApplyDefaultsMigratesLegacyThreadPingFields(t *testing.T) {
+	c := Config{Listen: ":8080", MaxSampleCount: 10000, Sources: []Source{{ID: "s", Family: "ipv4", SampleCount: 256, CFST: CFST{Threads: 4, PingCount: 200}}}}
+	ApplyDefaults(&c)
+	if c.Sources[0].CFST.Threads != 200 || c.Sources[0].CFST.PingCount != 4 {
+		t.Fatalf("legacy migration failed: threads=%d ping_count=%d", c.Sources[0].CFST.Threads, c.Sources[0].CFST.PingCount)
+	}
+}

@@ -1,878 +1,195 @@
 let cfg;
-let runtime = {sources:{}, targets:{}};
+let runtime = {sources:{},targets:{},health:{},period:'day'};
 let buildInfo = {version:'dev',commit:'unknown',built_at:'unknown',web_update_ready:false};
 let updateCheck = null;
-let statusTimer;
 let currentView = 'tasks';
-let toastTimer;
+let statusTimer = null;
+let toastTimer = null;
 let scanDetailSourceId = '';
+let furnaceData = {profiles:[],rules:[],period:'day'};
+let furnaceSourceFilter = 'all';
+let furnaceShowGray = false;
+let furnaceLoadedAt = 0;
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const clone = v => JSON.parse(JSON.stringify(v));
 const uid = p => `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`;
-
+const DEFAULT_SPEED_URL = 'https://cf.090227.xyz/__down?bytes=99999999';
+const DEFAULT_PROBE_URL = 'https://speed.cloudflare.com/cdn-cgi/trace';
 const DEFAULT_CFST = {
-  binary:'cfst',
-  url:'https://speed.cloudflare.com/__down?bytes=200000000',
-  port:443,
-  threads:4,
-  ping_count:200,
-  download_count:10,
-  download_time:10,
-  latency_max_ms:200,
-  latency_min_ms:0,
-  loss_max:0.2,
-  speed_min_mb:5,
-  httping:true,
-  colo:[],
-  all_ip:false
+  binary:'cfst',url:'',probe_url:'',port:443,threads:200,ping_count:4,download_count:10,download_time:10,
+  latency_max_ms:200,latency_min_ms:0,loss_max:.2,speed_min_mb:5,httping:false,colo:[],all_ip:false
 };
 
-async function api(url, opt={}) {
-  const r = await fetch(url, {headers:{'Content-Type':'application/json'}, ...opt});
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText || `HTTP ${r.status}`);
+async function api(url,opt={}){
+  const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opt});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||r.statusText||`HTTP ${r.status}`);
   return j;
 }
+function toast(msg,bad=false){const el=$('#toast');if(!el)return;el.textContent=msg;el.classList.toggle('bad',bad);el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),2600)}
+function shortCommit(v){v=String(v||'unknown');return v.length>8?v.slice(0,8):v}
+function compactError(v){let s=String(v||'').replace(/\r/g,' ').replace(/\n+/g,' ').replace(/\s+/g,' ').trim();if(s.length>180)s=s.slice(0,180)+'…';return s}
+function fmtNum(v,d=1){const n=Number(v||0);return Number.isFinite(n)?n.toFixed(d):'0'}
+function fmtPercent(v){return `${Math.round(Number(v||0)*100)}%`}
+function fmtFamily(f){return f==='ipv6'?'IPv6':'IPv4'}
+function recordType(f){return f==='ipv6'?'AAAA':'A'}
+function fmtInterval(n){n=Number(n||0);if(!n)return'手动';if(n%1440===0)return`${n/1440}天`;if(n%60===0)return`${n/60}小时`;return`${n}分钟`}
+function fmtTime(v){if(!v)return'—';const d=new Date(v);if(Number.isNaN(d.getTime()))return'—';return d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})}
+function relativeTime(ms){if(ms<=0)return'即将';const m=Math.ceil(ms/60000);if(m<60)return`${m}分钟后`;const h=Math.floor(m/60),rm=m%60;return rm?`${h}小时${rm}分后`:`${h}小时后`}
+function normalizeZoneDomain(v){return String(v||'').trim().toLowerCase().replace(/^https?:\/\//,'').split('/')[0].replace(/^\.+|\.+$/g,'')}
+function providerById(id){return (cfg.providers||[]).find(p=>p.id===id)}
+function sourceById(id){return (cfg.sources||[]).find(s=>s.id===id)}
+function sourceUseCount(id,exceptTargetId=''){return (cfg.targets||[]).reduce((n,t)=>n+(t.id===exceptTargetId?0:(t.sources||[]).filter(r=>r.source_id===id).length),0)}
+function composeHostname(provider,prefix){const domain=normalizeZoneDomain(provider?.zone_domain||'');let p=String(prefix||'').trim().toLowerCase().replace(/^\.+|\.+$/g,'');if(!domain)return'';if(!p||p==='@')return domain;if(p===domain||p.endsWith('.'+domain))return p;return`${p}.${domain}`}
+function taskPrefixValue(t,p){if(String(t?.prefix||'').trim())return String(t.prefix).trim().toLowerCase();const host=String(t?.hostname||'').trim().toLowerCase();const domain=normalizeZoneDomain(p?.zone_domain||'');if(!host)return'';if(domain&&host===domain)return'@';if(domain&&host.endsWith('.'+domain))return host.slice(0,-domain.length-1);return host}
+function taskHostname(t){const p=providerById(t.provider_id);return composeHostname(p,taskPrefixValue(t,p))||String(t.hostname||'').trim()}
+function taskLines(t){return (t.sources||[]).map(ref=>({ref,source:sourceById(ref.source_id)})).filter(x=>x.source)}
+function lineTitle(s){const c=(s.cfst?.colo||[]).join('/');return c?`${fmtFamily(s.family)} · ${c}`:fmtFamily(s.family)}
+function providerAuthMode(p){const m=String(p?.auth_mode||'').toLowerCase();if(['global_api_key','global','api_key'].includes(m))return'global_api_key';if(p?.email&&p?.api_key&&!p?.api_token)return'global_api_key';return'api_token'}
 
-function toast(msg, bad=false) {
-  const el = $('#toast');
-  el.textContent = msg;
-  el.classList.toggle('bad', bad);
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+function initConfig(){
+  cfg.providers ||= [];cfg.sources ||= [];cfg.targets ||= [];cfg.furnace_rules ||= [];
+  cfg.probe_url ||= DEFAULT_PROBE_URL;cfg.speed_url ||= DEFAULT_SPEED_URL;cfg.health_check_minutes ??=60;cfg.max_sample_count ||=10000;cfg.furnace_retention_days ||=45;
+  if(cfg.furnace_auto_rank===undefined)cfg.furnace_auto_rank=true;
+  cfg.sources.forEach(s=>{s.cfst={...clone(DEFAULT_CFST),...(s.cfst||{})};s.sample_count=Number(s.sample_count|| (s.cfst.all_ip?cfg.max_sample_count:256));s.cfst.all_ip=false;s.keep_results=Number(s.keep_results||50)});
 }
+async function load(){
+  try{
+    const [nextCfg,nextBuild]=await Promise.all([api('/api/config'),api('/api/version?ts='+Date.now()).catch(()=>buildInfo)]);
+    cfg=nextCfg;buildInfo=nextBuild||buildInfo;initConfig();renderVersionBadge();renderAll();await refreshStatus(true);
+  }catch(e){toast(`加载失败：${e.message}`,true)}
+}
+function renderVersionBadge(){const e=$('.eyebrow');if(e)e.innerHTML=`BESTIP MANAGER <span class="version-badge">${esc(buildInfo.version||'dev')} · ${esc(shortCommit(buildInfo.commit))}</span>`}
+function renderAll(){renderTasks();renderProviders();renderSettings();if(currentView==='furnace')loadFurnace(true)}
 
-async function load() {
-  try {
-    const [nextCfg, nextBuild] = await Promise.all([
-      api('/api/config'),
-      api('/api/version?ts=' + Date.now()).catch(() => buildInfo)
-    ]);
-    cfg = nextCfg;
-    buildInfo = nextBuild || buildInfo;
-    cfg.providers ||= [];
-    cfg.sources ||= [];
-    cfg.targets ||= [];
-    renderVersionBadge();
-    renderAll();
-    await refreshStatus();
-    clearInterval(statusTimer);
-    statusTimer = setInterval(refreshStatus, 3000);
-  } catch (e) {
-    toast(`加载失败：${e.message}`, true);
+function resultCountFor(id){return runtime.sources?.[id]?.results?.length||0}
+function taskRunning(t){return taskLines(t).some(x=>runtime.sources?.[x.source.id]?.running)}
+function taskError(t){for(const x of taskLines(t)){const e=runtime.sources?.[x.source.id]?.error;if(e)return compactError(e)}const ts=runtime.targets?.[t.id];return ts?.ok===false?compactError(ts.error):''}
+function nextRunForTask(t){
+  let best=Infinity,manual=true;
+  for(const {source:s} of taskLines(t)){
+    const iv=Number(s.interval_minutes||0);if(!iv)continue;manual=false;
+    const st=runtime.sources?.[s.id]||{};const base=new Date(st.ended_at||st.started_at||Date.now()).getTime();const left=base+iv*60000-Date.now();if(left<best)best=left;
   }
+  return manual?'仅手动':relativeTime(best===Infinity?0:best);
+}
+function taskState(t){
+  if(!t.enabled)return{cls:'disabled',badge:'',text:'已关闭'};
+  if(taskRunning(t))return{cls:'state-running',badge:'running',text:'严选中'};
+  const err=taskError(t);if(err)return{cls:'state-error',badge:'bad',text:'异常'};
+  const ran=taskLines(t).some(x=>runtime.sources?.[x.source.id]?.ended_at);
+  if(ran)return{cls:'state-waiting',badge:'ok',text:'等待下次'};
+  return{cls:'state-pending',badge:'',text:'待首次运行'};
+}
+function renderTasks(){
+  const list=$('#taskList');if(!list||!cfg)return;
+  const targets=cfg.targets||[];const running=targets.filter(taskRunning).length;const errors=targets.filter(t=>!!taskError(t)).length;
+  $('#summary').innerHTML=`<div class="summary-box"><b>${targets.length}</b><span>域名任务</span></div><div class="summary-box"><b>${running}</b><span>正在严选</span></div><div class="summary-box"><b>${errors}</b><span>异常任务</span></div>`;
+  if(!targets.length){list.innerHTML='<div class="empty"><b>还没有任务</b>先在“我的”配置 Cloudflare，再建立第一个域名。</div>';return}
+  list.innerHTML='';
+  targets.forEach(t=>{
+    const state=taskState(t),err=taskError(t),lines=taskLines(t),p=providerById(t.provider_id),healthRows=[];
+    for(const x of lines){const hs=runtime.health?.[x.source.id];if(hs)healthRows.push(hs)}
+    const chips=[];[...new Set(lines.map(x=>x.source.family))].forEach(f=>chips.push(`<span class="chip ${f==='ipv6'?'v6':'v4'}">${recordType(f)} ${fmtFamily(f)}</span>`));
+    [...new Set(lines.flatMap(x=>x.source.cfst?.colo||[]))].slice(0,3).forEach(c=>chips.push(`<span class="chip colo">${esc(c)}</span>`));
+    if(p)chips.push(`<span class="chip">${esc(p.name||'Cloudflare')}</span>`);
+    if(healthRows.length){const good=healthRows.every(h=>h.ok);chips.push(`<span class="chip ${good?'health-good':'health-bad'}">健康 ${good?'正常':'需更换'}</span>`)}
+    const rows=lines.map(x=>{
+      const s=x.source,st=runtime.sources?.[s.id]||{},pr=st.progress||{};const pct=Number(pr.percent||0);
+      const meta=[(s.cfst?.colo||[]).join(','),`扫 ${s.sample_count||256}`,`写 ${x.ref.count||1}`,fmtInterval(s.interval_minutes)].filter(Boolean).join(' · ');
+      return `<div class="line-row" data-source="${esc(s.id)}"><span class="line-family">${recordType(s.family)}</span><span class="line-meta">${esc(s.name||lineTitle(s))} · ${esc(meta)}${st.running?`<div class="mini-progress"><i style="width:${Math.min(100,pct)}%"></i></div>`:''}</span><span class="line-result">${st.running?`${esc(st.stage||'扫描')} ${pct}%`:`${st.results?.length||0} 条`}</span></div>`;
+    }).join('');
+    const wrap=document.createElement('div');wrap.className='task-unit';
+    wrap.innerHTML=`<div class="task-unit-bar"><button class="task-power ${t.enabled?'on':'off'}" data-toggle>${t.enabled?'● 已开启':'○ 已关闭'}</button><span class="next-run">${t.enabled?`下次：${nextRunForTask(t)}`:'不会自动扫描'}</span></div><article class="task-card ${state.cls}"><div class="task-top"><div><div class="task-domain">${esc(taskHostname(t))}</div>${t.name?`<div class="task-name">${esc(t.name)}</div>`:''}</div><div class="status-dot ${state.badge}">${state.text}</div></div><div class="chips">${chips.join('')}</div><div class="line-preview">${rows||'<div class="line-row"><span class="line-meta">尚未配置线路</span></div>'}</div>${err?`<div class="task-error">${esc(err)}</div>`:''}<div class="card-actions"><button class="run" data-run>立即严选</button><button class="sync" data-sync>同步 DNS</button><button class="more" data-edit>•••</button></div></article>`;
+    wrap.querySelector('[data-toggle]').onclick=()=>toggleTask(t.id);
+    wrap.querySelector('[data-run]').onclick=()=>runTask(t);
+    wrap.querySelector('[data-sync]').onclick=()=>syncTask(t);
+    wrap.querySelector('[data-edit]').onclick=()=>openTaskEditor(t.id);
+    wrap.querySelectorAll('[data-source]').forEach(el=>el.onclick=()=>openScanDetail(el.dataset.source));
+    list.appendChild(wrap);
+  })
+}
+async function toggleTask(id){const t=cfg.targets.find(x=>x.id===id);if(!t)return;t.enabled=!t.enabled;recomputeSourceEnabled();await saveConfig(t.enabled?'任务已开启':'任务已关闭')}
+function recomputeSourceEnabled(){for(const s of cfg.sources)s.enabled=cfg.targets.some(t=>t.enabled&&(t.sources||[]).some(r=>r.source_id===s.id))}
+async function runTask(t){if(!t.enabled)return toast('先开启这个任务',true);const lines=taskLines(t);if(!lines.length)return toast('没有 IP 线路',true);try{for(const x of lines)await api('/api/run/source?id='+encodeURIComponent(x.source.id),{method:'POST'});toast(`已启动 ${lines.length} 条严选线路`);setTimeout(()=>refreshStatus(true),400)}catch(e){toast(e.message,true)}}
+async function syncTask(t){try{await api('/api/sync/target?id='+encodeURIComponent(t.id),{method:'POST'});toast('DNS 同步成功');refreshStatus(true)}catch(e){toast(`同步失败：${e.message}`,true)}}
+
+function openScanDetail(sourceId){scanDetailSourceId=sourceId;drawScanDetail()}
+function drawScanDetail(){
+  if(!scanDetailSourceId)return;const s=sourceById(scanDetailSourceId);const st=runtime.sources?.[scanDetailSourceId]||{};if(!s)return;
+  const p=st.progress||{},f=st.funnel||{},obs=st.observed||[];const good=obs.filter(r=>r.speed_tested&&r.qualified).length;const tested=obs.filter(r=>r.speed_tested).length;
+  const resultRows=obs.slice(0,240).map(r=>`<div class="result-row ${r.speed_tested?(r.qualified?'good':'bad'):'wait'}"><span class="ip">${esc(r.ip)}</span><span>${r.colo?esc(r.colo):'—'}</span><span>${fmtNum(r.latency_ms,0)}ms</span><span>${r.speed_tested?fmtNum(r.speed_mb,1)+'M':'待测速'}</span></div>`).join('');
+  const logs=(st.logs||[]).join('\n');
+  $('#modalRoot').innerHTML=`<div class="overlay" id="scanOverlay"><div class="sheet"><div class="sheet-head"><h3>${esc(s.name||lineTitle(s))}</h3><button class="sheet-close" data-close>×</button></div><div class="sheet-body"><div class="scan-head"><div><div class="scan-stage">${esc(st.stage||'等待运行')}</div><div class="help">候选 ${st.candidate_count||s.sample_count||0} · ${fmtFamily(s.family)} ${(s.cfst?.colo||[]).join('/')||'不限地区'}</div></div><button id="healthNowBtn" class="ghost compact">健康检查</button></div><div class="progress-bar"><i style="width:${Math.min(100,Number(p.percent||0))}%"></i></div><div class="scan-stats"><div class="metric"><b>${f.total_candidates||st.candidate_count||0}</b><span>候选</span></div><div class="metric"><b>${f.loss_passed||0}</b><span>初筛</span></div><div class="metric"><b>${tested}</b><span>决赛已测</span></div><div class="metric"><b>${good}</b><span>速度合格</span></div></div>${st.error?`<div class="task-error">${esc(compactError(st.error))}</div>`:''}<div class="mini-label">决赛明细 · 合格置顶并按速度排序</div><div class="result-table">${resultRows||'<div class="empty"><b>还没有决赛结果</b>延迟、丢包或地区不合格的 IP 已在前置漏斗淘汰。</div>'}</div><details class="advanced" ${st.running?'open':''}><summary>实时日志</summary><pre class="logs">${esc(logs||'暂无日志')}</pre></details></div><div class="sheet-actions"><button data-close>关闭</button><button class="primary" id="runThisLine">立即严选</button></div></div></div>`;
+  $('#scanOverlay').onclick=e=>{if(e.target.id==='scanOverlay')closeModal()};$$('#modalRoot [data-close]').forEach(b=>b.onclick=closeModal);
+  $('#runThisLine').onclick=async()=>{try{await api('/api/run/source?id='+encodeURIComponent(s.id),{method:'POST'});toast('已启动');refreshStatus(true)}catch(e){toast(e.message,true)}};
+  $('#healthNowBtn').onclick=async()=>{try{await api('/api/health/source?id='+encodeURIComponent(s.id),{method:'POST'});toast('已启动延迟 + 丢包 + 网速健康检查')}catch(e){toast(e.message,true)}};
 }
 
-function shortCommit(v) {
-  v = String(v || 'unknown');
-  return v.length > 8 ? v.slice(0,8) : v;
+function renderProviders(){const box=$('#providerList');if(!box||!cfg)return;const arr=cfg.providers||[];if(!arr.length){box.innerHTML='<div class="empty"><b>还没有 DNS 账号</b>添加 Cloudflare Zone 后，任务只需要填写域名前缀。</div>';return}box.innerHTML='';arr.forEach(p=>{const used=cfg.targets.filter(t=>t.provider_id===p.id).length;const d=document.createElement('div');d.className='provider-card';d.innerHTML=`<div class="provider-head"><div><b>${esc(p.name||'Cloudflare')}</b><div class="provider-meta">${esc(normalizeZoneDomain(p.zone_domain)||'未设置主域名')} · ${providerAuthMode(p)==='global_api_key'?'Email + Global API Key':'API Token'} · ${used} 个任务</div></div><div class="provider-actions"><button data-edit>编辑</button><button data-del>删除</button></div></div>`;d.querySelector('[data-edit]').onclick=()=>openProviderEditor(p.id);d.querySelector('[data-del]').onclick=()=>deleteProvider(p.id);box.appendChild(d)})}
+
+function renderSettings(){
+  const panel=$('#settingsPanel');if(!panel||!cfg)return;const ready=!!buildInfo.web_update_ready,available=!!updateCheck?.update_available,latest=updateCheck?.latest_commit?shortCommit(updateCheck.latest_commit):'未检查';
+  panel.innerHTML=`<div class="settings-card"><div class="update-head"><div><div class="mini-label">当前版本</div><div class="version-title">${esc(buildInfo.version||'dev')} <span>${esc(shortCommit(buildInfo.commit))}</span></div><div class="help">构建 ${esc(buildInfo.built_at||'unknown')} · 最新 main ${esc(latest)}</div></div><span class="update-state ${available?'available':''}">${available?'有新版本':'版本状态'}</span></div><div id="updateMessage" class="modal-note">${ready?'Web 一键更新已启用。':'未挂载 Docker Socket，只能检查版本。'}</div><div class="grid2 update-actions"><button id="checkUpdateBtn" class="ghost">检查更新</button><button id="applyUpdateBtn" class="primary" ${ready?'':'disabled'}>${available?'更新到最新版':'重新拉取最新版'}</button></div></div>
+  <div class="settings-card"><h3>全局测速网络</h3><label class="field"><span>延迟 / 地区探测地址</span><input id="setProbeURL" value="${esc(cfg.probe_url||DEFAULT_PROBE_URL)}"><small>TCPing 延迟本身不依赖 URL；HTTPing 与 Colo 探测使用这里。默认使用轻量 Cloudflare trace。</small></label><label class="field"><span>下载测速地址</span><input id="setSpeedURL" value="${esc(cfg.speed_url||DEFAULT_SPEED_URL)}"><small>默认 CM：cf.090227.xyz，避免把 Cloudflare 官方下载源作为长期高频测速源。线路高级设置可单独覆盖。</small></label><div class="grid2"><label class="field"><span>健康检查周期 / 分钟</span><input id="setHealth" type="number" min="1" value="${Number(cfg.health_check_minutes||60)}"></label><label class="field"><span>单线路最大采样数</span><input id="setMaxSample" type="number" min="1" max="100000" value="${Number(cfg.max_sample_count||10000)}"></label></div><div class="modal-note">健康检查会同时复核当前在用 IP 的 <b>延迟 + 丢包 + 网速 + 地区</b>。任一不达标就触发完整严选替换，不再只看延迟。</div></div>
+  <div class="settings-card"><h3>熔炉学习</h3><div class="switch-line"><div><b style="font-size:10px">分时段历史加权</b><span class="help">成熟后只在本轮新鲜合格 IP 中按日/夜历史表现重排，不会复活失效 IP。</span></div><input id="setFurnaceRank" class="switch" type="checkbox" ${cfg.furnace_auto_rank?'checked':''}></div><div class="grid2" style="margin-top:9px"><label class="field"><span>历史保留 / 天</span><input id="setRetention" type="number" min="7" max="365" value="${Number(cfg.furnace_retention_days||45)}"></label><label class="field"><span>最大并发任务</span><input id="setConcurrency" type="number" min="1" max="16" value="${Number(cfg.max_concurrency||2)}"></label></div></div>
+  <button id="saveGlobal" class="primary" style="width:100%;padding:10px;margin-bottom:9px">保存全局设置</button>
+  <div class="settings-card"><details><summary>高级 / 调试</summary><label class="field" style="margin-top:10px"><span>监听地址</span><input id="setListen" value="${esc(cfg.listen||':8080')}"></label><textarea id="rawConfig" class="raw">${esc(JSON.stringify(cfg,null,2))}</textarea><div class="grid2" style="margin-top:7px"><button id="copyRaw" class="ghost">复制 JSON</button><button id="applyRaw" class="danger-btn">应用 JSON</button></div></details></div>`;
+  $('#checkUpdateBtn').onclick=checkForUpdate;$('#applyUpdateBtn').onclick=applyWebUpdate;
+  $('#saveGlobal').onclick=async()=>{cfg.probe_url=$('#setProbeURL').value.trim()||DEFAULT_PROBE_URL;cfg.speed_url=$('#setSpeedURL').value.trim()||DEFAULT_SPEED_URL;cfg.health_check_minutes=Math.max(1,Number($('#setHealth').value)||60);cfg.max_sample_count=Math.max(1,Math.min(100000,Number($('#setMaxSample').value)||10000));cfg.furnace_retention_days=Math.max(7,Number($('#setRetention').value)||45);cfg.furnace_auto_rank=$('#setFurnaceRank').checked;cfg.max_concurrency=Math.max(1,Number($('#setConcurrency').value)||2);cfg.listen=$('#setListen')?.value.trim()||cfg.listen||':8080';cfg.sources.forEach(s=>s.sample_count=Math.min(Number(s.sample_count||256),cfg.max_sample_count));await saveConfig('全局设置已保存')};
+  $('#copyRaw').onclick=async()=>{try{await navigator.clipboard.writeText($('#rawConfig').value);toast('JSON 已复制')}catch{toast('浏览器不允许复制',true)}};
+  $('#applyRaw').onclick=async()=>{try{cfg=JSON.parse($('#rawConfig').value);initConfig();await saveConfig('JSON 已应用')}catch(e){toast(e.message,true)}};
 }
 
-function compactError(v) {
-  let s = String(v || '').replace(/\r/g,' ').replace(/\n+/g,' ').replace(/\s+/g,' ').trim();
-  const helpAt = s.indexOf('参数：');
-  if (helpAt > 0) s = s.slice(0, helpAt).trim();
-  if (s.length > 220) s = s.slice(0,220) + '…';
-  return s;
+async function checkForUpdate(){const m=$('#updateMessage');if(m)m.textContent='正在检查 GitHub main…';try{updateCheck=await api('/api/update/check?ts='+Date.now());buildInfo=updateCheck.current||buildInfo;renderVersionBadge();renderSettings();toast(updateCheck.update_available?'发现新版本':'当前已是最新 main')}catch(e){toast(`检查更新失败：${e.message}`,true)}}
+async function applyWebUpdate(){if(!buildInfo.web_update_ready)return toast('当前未启用 Web 更新',true);if(!confirm('将拉取 latest 并重建容器，页面会短暂断开。继续吗？'))return;const old=String(buildInfo.commit||'');try{await api('/api/update/apply',{method:'POST'});toast('已启动更新，等待重新上线');waitForUpdatedService(old)}catch(e){toast(`更新失败：${e.message}`,true)}}
+function waitForUpdatedService(old){let n=0;const timer=setInterval(async()=>{n++;try{const x=await api('/api/version?ts='+Date.now());if(x?.commit&&(x.commit!==old||n>5)){clearInterval(timer);buildInfo=x;renderVersionBadge();toast(`更新完成：${x.version} · ${shortCommit(x.commit)}`);setTimeout(()=>location.reload(),700)}}catch{}if(n>=80){clearInterval(timer);toast('更新等待超时，请手动刷新确认',true)}},2500)}
+async function saveConfig(okText='已保存'){try{await api('/api/config',{method:'PUT',body:JSON.stringify(cfg)});toast(okText);renderAll();return true}catch(e){toast(`保存失败：${e.message}`,true);return false}}
+
+function openTaskEditor(targetId=''){
+  if(!cfg.providers.length){toast('请先在“我的”添加 DNS 账号',true);switchView('account');return}
+  const existing=targetId?cfg.targets.find(t=>t.id===targetId):null;
+  const t=existing?clone(existing):{id:uid('task'),name:'',enabled:true,provider_id:cfg.providers[0].id,prefix:'',hostname:'',ttl:60,proxied:false,sources:[]};
+  t.prefix=taskPrefixValue(t,providerById(t.provider_id));
+  const drafts=existing?taskLines(existing).map(x=>({originalSourceId:x.source.id,ref:clone(x.ref),source:clone(x.source),shared:sourceUseCount(x.source.id,existing.id)>0})):[newLineDraft('ipv4')];
+  const root=$('#modalRoot');root.innerHTML=`<div class="overlay" id="taskOverlay"><div class="sheet"><div class="sheet-head"><h3>${existing?'编辑域名任务':'新建域名任务'}</h3><button class="sheet-close" data-close>×</button></div><div class="sheet-body"><label class="field"><span>DNS 账号</span><select id="taskProvider">${providerOptions(t.provider_id)}</select></label><div class="mini-label">最终域名 · 按实际书写顺序</div><div class="domain-builder"><input id="taskPrefix" value="${esc(t.prefix||'')}" placeholder="v4 / nrtv4 / @"><span class="domain-dot">.</span><div id="taskDomainFixed" class="domain-fixed"></div></div><div id="taskDomainPreview" class="domain-preview"></div><label class="field"><span>备注（可选）</span><input id="taskName" value="${esc(t.name||'')}" placeholder="例如 日本 NRT 严选"></label><div class="mini-label">IP 线路</div><div id="lineEditors"></div><button id="addLineBtn" class="add-line">＋ 添加一条线路</button><details class="advanced"><summary>DNS 高级设置</summary><div class="grid2"><label class="field"><span>TTL</span><input id="taskTTL" type="number" min="1" value="${Number(t.ttl||60)}"></label><label class="field"><span>Cloudflare 代理</span><select id="taskProxied"><option value="false" ${!t.proxied?'selected':''}>关闭</option><option value="true" ${t.proxied?'selected':''}>开启</option></select></label></div></details>${existing?'<div class="danger-zone"><button id="deleteTaskBtn" class="danger-btn">删除这个任务</button></div>':''}</div><div class="sheet-actions"><button data-close>取消</button><button id="saveTaskBtn" class="primary">保存任务</button></div></div></div>`;
+  function drawLines(){const box=$('#lineEditors');box.innerHTML='';drafts.forEach((d,i)=>{d.source.cfst={...clone(DEFAULT_CFST),...(d.source.cfst||{})};d.source.sample_count=Number(d.source.sample_count||256);const s=d.source,ref=d.ref,e=document.createElement('div');e.className='line-editor';e.innerHTML=`<div class="line-editor-head"><div class="line-editor-title">线路 ${i+1}</div><button class="remove-line" data-remove>删除</button></div><div class="grid2"><label class="field"><span>线路名称</span><input data-name value="${esc(s.name||'')}" placeholder="NRT IPv4"></label><label class="field"><span>协议</span><select data-family><option value="ipv4" ${s.family==='ipv4'?'selected':''}>IPv4 / A</option><option value="ipv6" ${s.family==='ipv6'?'selected':''}>IPv6 / AAAA</option></select></label></div><label class="field"><span>IP 段 / IP 源</span><textarea data-inputs placeholder="每行一个 CIDR、IP 或 URL">${esc((s.inputs||[]).join('\n'))}</textarea></label><div class="grid2"><label class="field"><span>本轮扫描数量</span><input data-sample type="number" min="1" max="${Number(cfg.max_sample_count||10000)}" value="${Number(s.sample_count||256)}"></label><label class="field"><span>结果地区（可空）</span><input data-colo value="${esc((s.cfst.colo||[]).join(','))}" placeholder="NRT"></label></div><div class="capacity-note" data-capacity></div><div class="thresholds"><label class="field"><span>延迟≤ms</span><input data-latency type="number" min="0" value="${Number(s.cfst.latency_max_ms??200)}"></label><label class="field"><span>丢包≤</span><input data-loss type="number" step="0.01" min="0" max="1" value="${Number(s.cfst.loss_max??.2)}"></label><label class="field"><span>速度≥MB/s</span><input data-speed type="number" step="0.1" min="0" value="${Number(s.cfst.speed_min_mb??5)}"></label></div><div class="grid2"><label class="field"><span>写入数量</span><input data-count type="number" min="1" max="100" value="${Number(ref.count||5)}"></label><label class="field"><span>自动周期</span><select data-interval>${intervalOptions(s.interval_minutes)}</select></label></div><details class="advanced"><summary>严选高级参数</summary><div class="grid3"><label class="field"><span>测速秒数/IP</span><input data-dt type="number" min="1" max="60" value="${Number(s.cfst.download_time||10)}"></label><label class="field"><span>初筛并发</span><input data-threads type="number" min="1" max="1000" value="${Number(s.cfst.threads||200)}"></label><label class="field"><span>延迟次数</span><input data-ping type="number" min="1" max="10" value="${Number(s.cfst.ping_count||4)}"></label></div><div class="grid2"><label class="field"><span>结果缓存数量</span><input data-keep type="number" min="1" max="500" value="${Number(s.keep_results||50)}"></label><label class="field"><span>HTTPing</span><select data-httping><option value="false" ${!s.cfst.httping?'selected':''}>TCPing（默认）</option><option value="true" ${s.cfst.httping?'selected':''}>HTTPing</option></select></label></div><label class="field"><span>测速地址覆盖（留空=全局）</span><input data-url value="${esc(s.cfst.url||'')}" placeholder="${esc(cfg.speed_url||DEFAULT_SPEED_URL)}"></label><label class="field"><span>探测地址覆盖（留空=全局）</span><input data-probe value="${esc(s.cfst.probe_url||'')}" placeholder="${esc(cfg.probe_url||DEFAULT_PROBE_URL)}"></label></details>`;
+    const sampleInput=e.querySelector('[data-sample]'),cap=e.querySelector('[data-capacity]');
+    const updateCap=()=>{s.inputs=splitLines(e.querySelector('[data-inputs]').value);s.family=e.querySelector('[data-family]').value;let req=Math.max(1,Number(sampleInput.value)||1);req=Math.min(req,Number(cfg.max_sample_count||10000));const info=estimateInputCapacity(s.inputs,s.family,req);if(info.finite&&info.capacityNum<req){req=Math.max(1,info.capacityNum);sampleInput.value=req}s.sample_count=req;cap.innerHTML=capacityText(info,req)};
+    e.querySelector('[data-remove]').onclick=()=>{drafts.splice(i,1);drawLines()};e.querySelector('[data-name]').oninput=ev=>s.name=ev.target.value;e.querySelector('[data-family]').onchange=updateCap;e.querySelector('[data-inputs]').oninput=updateCap;sampleInput.oninput=updateCap;e.querySelector('[data-colo]').oninput=ev=>s.cfst.colo=splitComma(ev.target.value).map(x=>x.toUpperCase());e.querySelector('[data-count]').oninput=ev=>ref.count=Math.max(1,Number(ev.target.value)||1);e.querySelector('[data-interval]').onchange=ev=>s.interval_minutes=Number(ev.target.value);e.querySelector('[data-latency]').oninput=ev=>s.cfst.latency_max_ms=Number(ev.target.value)||0;e.querySelector('[data-loss]').oninput=ev=>s.cfst.loss_max=Number(ev.target.value);e.querySelector('[data-speed]').oninput=ev=>s.cfst.speed_min_mb=Number(ev.target.value)||0;e.querySelector('[data-dt]').oninput=ev=>s.cfst.download_time=Math.max(1,Number(ev.target.value)||10);e.querySelector('[data-threads]').oninput=ev=>s.cfst.threads=Math.max(1,Number(ev.target.value)||200);e.querySelector('[data-ping]').oninput=ev=>s.cfst.ping_count=Math.max(1,Number(ev.target.value)||4);e.querySelector('[data-keep]').oninput=ev=>s.keep_results=Math.max(1,Number(ev.target.value)||50);e.querySelector('[data-httping]').onchange=ev=>s.cfst.httping=ev.target.value==='true';e.querySelector('[data-url]').oninput=ev=>s.cfst.url=ev.target.value.trim();e.querySelector('[data-probe]').oninput=ev=>s.cfst.probe_url=ev.target.value.trim();updateCap();box.appendChild(e)})}
+  drawLines();$('#addLineBtn').onclick=()=>{drafts.push(newLineDraft(drafts.some(d=>d.source.family==='ipv4')?'ipv6':'ipv4'));drawLines()};
+  const updateDomain=()=>{const p=providerById($('#taskProvider').value),domain=normalizeZoneDomain(p?.zone_domain||''),prefix=$('#taskPrefix').value.trim().toLowerCase();$('#taskDomainFixed').textContent=domain||'未设置主域名';const h=composeHostname(p,prefix);$('#taskDomainPreview').innerHTML=`<b>最终域名</b><span>${esc(h||'请输入前缀；根域名用 @')}</span>`};$('#taskProvider').onchange=updateDomain;$('#taskPrefix').oninput=updateDomain;updateDomain();
+  $$('#modalRoot [data-close]').forEach(b=>b.onclick=closeModal);$('#taskOverlay').onclick=e=>{if(e.target.id==='taskOverlay')closeModal()};
+  $('#saveTaskBtn').onclick=async()=>{t.provider_id=$('#taskProvider').value;const p=providerById(t.provider_id);t.prefix=$('#taskPrefix').value.trim().toLowerCase();t.hostname=composeHostname(p,t.prefix);t.name=$('#taskName').value.trim();t.ttl=Math.max(1,Number($('#taskTTL').value)||60);t.proxied=$('#taskProxied').value==='true';if(!normalizeZoneDomain(p?.zone_domain))return toast('这个 DNS 账号没有主域名',true);if(!t.prefix)return toast('请填写域名前缀；根域名用 @',true);if(drafts.some(d=>!(d.source.inputs||[]).length))return toast('每条线路至少要有一个 IP 段或来源',true);if(await persistTask(t,drafts,existing))closeModal()};
+  if(existing)$('#deleteTaskBtn').onclick=async()=>{if(!confirm(`删除 ${taskHostname(existing)}？`))return;deleteTask(existing.id);if(await saveConfig('任务已删除'))closeModal()}
 }
+function newLineDraft(family='ipv4'){return{originalSourceId:'',shared:false,ref:{source_id:'',count:5},source:{id:uid('line'),name:family==='ipv6'?'IPv6':'IPv4',enabled:true,family,inputs:[],interval_minutes:360,keep_results:50,sample_count:256,cfst:clone(DEFAULT_CFST)}}}
+async function persistTask(t,drafts,existing){const oldIds=existing?(existing.sources||[]).map(r=>r.source_id):[],nextRefs=[],nextIds=new Set();for(const d of drafts){const s=clone(d.source);s.cfst={...clone(DEFAULT_CFST),...(s.cfst||{})};s.inputs=(s.inputs||[]).map(x=>x.trim()).filter(Boolean);s.cfst.colo=(s.cfst.colo||[]).map(x=>String(x).trim().toUpperCase()).filter(Boolean);s.cfst.all_ip=false;s.sample_count=Math.max(1,Math.min(Number(cfg.max_sample_count||10000),Number(s.sample_count||256)));if(!s.name.trim())s.name=lineTitle(s);let id=d.originalSourceId||s.id||uid('line');if(d.shared)id=uid('line');s.id=id;nextIds.add(id);const idx=cfg.sources.findIndex(x=>x.id===id);if(idx>=0)cfg.sources[idx]=s;else cfg.sources.push(s);nextRefs.push({source_id:id,count:Math.max(1,Number(d.ref.count)||1)})}for(const old of oldIds){if(!nextIds.has(old)&&sourceUseCount(old,existing?.id||'')===0){cfg.sources=cfg.sources.filter(s=>s.id!==old);cfg.furnace_rules=cfg.furnace_rules.filter(r=>r.source_id!==old)}}t.sources=nextRefs;const ti=cfg.targets.findIndex(x=>x.id===t.id);if(ti>=0)cfg.targets[ti]=t;else cfg.targets.push(t);recomputeSourceEnabled();return await saveConfig(existing?'任务已更新':'任务已创建')}
+function deleteTask(id){const t=cfg.targets.find(x=>x.id===id);if(!t)return;const refs=(t.sources||[]).map(r=>r.source_id);cfg.targets=cfg.targets.filter(x=>x.id!==id);for(const sid of refs){if(!cfg.targets.some(x=>(x.sources||[]).some(r=>r.source_id===sid))){cfg.sources=cfg.sources.filter(s=>s.id!==sid);cfg.furnace_rules=cfg.furnace_rules.filter(r=>r.source_id!==sid)}}recomputeSourceEnabled()}
+function providerOptions(selected){return cfg.providers.map(p=>`<option value="${esc(p.id)}" ${p.id===selected?'selected':''}>${esc(p.name||p.id)} · ${esc(normalizeZoneDomain(p.zone_domain))}</option>`).join('')}
+function intervalOptions(selected){const opts=[[0,'手动'],[60,'每 1 小时'],[180,'每 3 小时'],[360,'每 6 小时'],[720,'每 12 小时'],[1440,'每天']];if(selected&&!opts.some(x=>x[0]===Number(selected)))opts.push([Number(selected),`${selected} 分钟`]);return opts.map(([v,n])=>`<option value="${v}" ${Number(selected)===v?'selected':''}>${n}</option>`).join('')}
+function splitLines(v){return String(v||'').split(/\n+/).map(x=>x.trim()).filter(Boolean)}function splitComma(v){return String(v||'').split(',').map(x=>x.trim()).filter(Boolean)}
 
-function renderVersionBadge() {
-  const eyebrow = document.querySelector('.eyebrow');
-  if (!eyebrow) return;
-  eyebrow.innerHTML = `BESTIP MANAGER <span class="version-badge">${esc(buildInfo.version || 'dev')} · ${esc(shortCommit(buildInfo.commit))}</span>`;
-}
+function estimateInputCapacity(inputs,family,requested){let total=0n,ranges=0,unknown=false,huge=false;for(const raw of inputs){const v=String(raw||'').trim();if(!v)continue;if(/^https?:\/\//i.test(v)){unknown=true;continue}let prefix;if(v.includes('/'))prefix=Number(v.split('/').pop());else prefix=family==='ipv6'?128:32;if(!Number.isFinite(prefix)){unknown=true;continue}const bits=family==='ipv6'?128:32;if(prefix<0||prefix>bits){unknown=true;continue}ranges++;const host=bits-prefix;if(host>52){huge=true;total+=BigInt(Number.MAX_SAFE_INTEGER)}else total+=1n<<BigInt(host)}const max=BigInt(Number(cfg.max_sample_count||10000));let finite=!unknown&&!huge;let capNum=finite?Number(total>max?max:total):Number(cfg.max_sample_count||10000);if(finite&&total<BigInt(capNum))capNum=Number(total);return{ranges,unknown,huge,finite,capacity:total,capacityNum:capNum,requested}}
+function capacityText(info,req){if(!info.ranges&&info.unknown)return'远程 IP 源将在运行时解析并按扫描数量采样。';if(!info.ranges)return'请填写 CIDR 或 IP。';const per=info.ranges?Math.floor(req/info.ranges):req;let pool;if(info.huge)pool='IPv6 巨大地址池';else if(info.unknown)pool='含远程列表，容量运行时确认';else pool=`可用容量 ${info.capacity.toString()}`;return`<b>${info.ranges} 个本地号段</b> · ${pool} · 本轮 ${req} · 每段约 ${per}${info.ranges>1?'（余数自动均分）':''}`}
 
-function renderAll() {
-  renderTasks();
-  renderProviders();
-  renderSettings();
-}
+function openProviderEditor(providerId=''){const existing=providerId?cfg.providers.find(p=>p.id===providerId):null,p=existing?clone(existing):{id:uid('cf'),name:'Cloudflare',type:'cloudflare',zone_id:'',zone_domain:'',auth_mode:'api_token',api_token:'',email:'',api_key:''};p.auth_mode=providerAuthMode(p);$('#modalRoot').innerHTML=`<div class="overlay" id="providerOverlay"><div class="sheet"><div class="sheet-head"><h3>${existing?'编辑 DNS 账号':'添加 DNS 账号'}</h3><button class="sheet-close" data-close>×</button></div><div class="sheet-body"><label class="field"><span>名称</span><input id="providerName" value="${esc(p.name||'Cloudflare')}"></label><label class="field"><span>主域名 / Zone</span><input id="providerDomain" value="${esc(p.zone_domain||'')}" placeholder="629717.xyz"></label><label class="field"><span>Zone ID</span><input id="providerZone" value="${esc(p.zone_id||'')}"></label><label class="field"><span>认证方式</span><select id="providerAuthMode"><option value="api_token" ${p.auth_mode==='api_token'?'selected':''}>API Token（推荐）</option><option value="global_api_key" ${p.auth_mode==='global_api_key'?'selected':''}>Email + Global API Key</option></select></label><div id="providerTokenBox"><label class="field"><span>API Token</span><input id="providerToken" type="password" value="${esc(p.api_token||'')}"></label></div><div id="providerGlobalKeyBox"><label class="field"><span>Cloudflare 邮箱</span><input id="providerEmail" type="email" value="${esc(p.email||'')}"></label><label class="field"><span>Global API Key</span><input id="providerAPIKey" type="password" value="${esc(p.api_key||'')}"></label></div><div class="modal-note">任务里只填写前缀。例如 <b>nrtv4</b> + <b>${esc(p.zone_domain||'629717.xyz')}</b> → 完整域名。</div></div><div class="sheet-actions provider-sheet-actions"><button data-close>取消</button><button id="testProviderBtn" class="ghost">测试连接</button><button id="saveProviderBtn" class="primary">保存</button></div></div></div>`;const read=()=>{p.name=$('#providerName').value.trim()||'Cloudflare';p.zone_domain=normalizeZoneDomain($('#providerDomain').value);p.zone_id=$('#providerZone').value.trim();p.auth_mode=$('#providerAuthMode').value;p.api_token=$('#providerToken').value.trim();p.email=$('#providerEmail').value.trim();p.api_key=$('#providerAPIKey').value.trim();return p};const validate=()=>{read();if(!p.zone_domain)return'请填写主域名';if(!p.zone_id)return'请填写 Zone ID';if(p.auth_mode==='global_api_key'&&(!p.email||!p.api_key))return'需要邮箱和 Global API Key';if(p.auth_mode==='api_token'&&!p.api_token)return'请填写 API Token';return''};const draw=()=>{const legacy=$('#providerAuthMode').value==='global_api_key';$('#providerTokenBox').style.display=legacy?'none':'';$('#providerGlobalKeyBox').style.display=legacy?'':'none'};$('#providerAuthMode').onchange=draw;draw();$$('#modalRoot [data-close]').forEach(b=>b.onclick=closeModal);$('#providerOverlay').onclick=e=>{if(e.target.id==='providerOverlay')closeModal()};$('#testProviderBtn').onclick=async()=>{const er=validate();if(er)return toast(er,true);try{await api('/api/provider/test',{method:'POST',body:JSON.stringify(read())});toast('Cloudflare 认证和 Zone 正常')}catch(e){toast(e.message,true)}};$('#saveProviderBtn').onclick=async()=>{const er=validate();if(er)return toast(er,true);read();const i=cfg.providers.findIndex(x=>x.id===p.id);if(i>=0)cfg.providers[i]=p;else cfg.providers.push(p);if(await saveConfig(existing?'DNS 账号已更新':'DNS 账号已添加'))closeModal()}}
+async function deleteProvider(id){const p=providerById(id),used=cfg.targets.filter(t=>t.provider_id===id);if(used.length)return toast(`还有 ${used.length} 个任务在使用`,true);if(!confirm(`删除 ${p?.name||id}？`))return;cfg.providers=cfg.providers.filter(x=>x.id!==id);await saveConfig('DNS 账号已删除')}
 
-function sourceById(id) { return (cfg.sources || []).find(s => s.id === id); }
-function providerById(id) { return (cfg.providers || []).find(p => p.id === id); }
-function normalizeZoneDomain(v) {
-  v = String(v || '').trim().toLowerCase().replace(/^https?:\/\//,'').replace(/^\/+|\/+$/g,'').replace(/\.+$/,'');
-  if (v.includes('/')) v = v.split('/')[0];
-  return v;
-}
-function providerAuthMode(p={}) {
-  const m = String(p.auth_mode || '').toLowerCase();
-  if (['global_api_key','global','api_key'].includes(m)) return 'global_api_key';
-  if (!p.api_token && p.email && p.api_key) return 'global_api_key';
-  return 'api_token';
-}
-function composeHostname(provider, prefix) {
-  const domain = normalizeZoneDomain(provider?.zone_domain || '');
-  let p = String(prefix || '').trim().toLowerCase().replace(/^\.+|\.+$/g,'');
-  if (p === '@') return domain;
-  if (!domain) return p;
-  if (!p) return '';
-  if (p === domain || p.endsWith('.' + domain)) return p;
-  return `${p}.${domain}`;
-}
-function taskPrefixValue(t, provider) {
-  if (String(t?.prefix || '').trim()) return String(t.prefix).trim().toLowerCase();
-  const host = String(t?.hostname || '').trim().toLowerCase().replace(/\.+$/,'');
-  const domain = normalizeZoneDomain(provider?.zone_domain || '');
-  if (!host) return '';
-  if (domain && host === domain) return '@';
-  if (domain && host.endsWith('.' + domain)) return host.slice(0, -(domain.length + 1));
-  return host;
-}
-function taskHostname(t) {
-  const p = providerById(t?.provider_id);
-  const prefix = taskPrefixValue(t, p);
-  return composeHostname(p, prefix) || String(t?.hostname || '').trim().toLowerCase();
-}
-function sourceUseCount(id, exceptTargetId='') {
-  return (cfg.targets || []).reduce((n,t) => n + (t.id === exceptTargetId ? 0 : (t.sources || []).filter(r => r.source_id === id).length), 0);
-}
-function taskLines(t) {
-  return (t.sources || []).map(ref => ({ref, source:sourceById(ref.source_id)})).filter(x => x.source);
-}
-function fmtFamily(f) { return f === 'ipv6' ? 'IPv6' : 'IPv4'; }
-function recordType(f) { return f === 'ipv6' ? 'AAAA' : 'A'; }
-function fmtInterval(n) {
-  n = Number(n || 0);
-  if (!n) return '手动';
-  if (n % 1440 === 0) return `${n/1440}天`;
-  if (n % 60 === 0) return `${n/60}小时`;
-  return `${n}分钟`;
-}
-function lineTitle(source) {
-  const colo = (source.cfst?.colo || []).join('/');
-  return colo ? `${fmtFamily(source.family)} · ${colo}` : fmtFamily(source.family);
-}
-function resultCountFor(sourceId) { return runtime.sources?.[sourceId]?.results?.length || 0; }
-function requiredCountForSource(sourceId) {
-  const counts = [];
-  for (const t of (cfg.targets || [])) {
-    for (const r of (t.sources || [])) if (r.source_id === sourceId) counts.push(Number(r.count || 1));
-  }
-  return counts.length ? Math.max(...counts) : 1;
-}
-function taskRunning(t) { return taskLines(t).some(x => runtime.sources?.[x.source.id]?.running); }
-function taskError(t) {
-  for (const x of taskLines(t)) {
-    const e = runtime.sources?.[x.source.id]?.error;
-    if (e) return compactError(e);
-  }
-  return runtime.targets?.[t.id]?.ok === false ? compactError(runtime.targets[t.id].error) : '';
-}
+async function loadFurnace(force=false){if(!force&&Date.now()-furnaceLoadedAt<5000)return;try{furnaceData=await api('/api/furnace?limit=1000&ts='+Date.now());furnaceLoadedAt=Date.now();renderFurnace()}catch(e){if(currentView==='furnace')toast(`熔炉读取失败：${e.message}`,true)}}
+function renderFurnace(){const list=$('#furnaceList'),hero=$('#furnaceHero'),filters=$('#furnaceFilters');if(!list||!cfg)return;const profiles=furnaceData.profiles||[],admitted=profiles.filter(p=>p.admitted),mature=admitted.filter(p=>p.maturity>=100),period=furnaceData.period==='night'?'夜间':'日间';hero.innerHTML=`<div class="furnace-hero"><div><div class="big">${admitted.length}</div><div class="sub">已取得炼丹资格 · ${mature.length} 个学习成熟</div></div><div class="period"><span class="sub">当前分时段</span><b>${period}</b><span class="sub">成熟 IP 自动按当前时段历史加权</span></div></div>`;const sourceIds=[...new Set(profiles.map(p=>p.source_id))];filters.innerHTML=`<div class="filter-row"><button class="filter-pill ${furnaceSourceFilter==='all'?'active':''}" data-filter="all">全部</button>${sourceIds.map(id=>`<button class="filter-pill ${furnaceSourceFilter===id?'active':''}" data-filter="${esc(id)}">${esc(sourceById(id)?.name||id)}</button>`).join('')}<button class="filter-pill ${furnaceShowGray?'active':''}" id="grayToggle">${furnaceShowGray?'隐藏灰名单':'显示灰名单'}</button></div>`;filters.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{furnaceSourceFilter=b.dataset.filter;renderFurnace()});$('#grayToggle').onclick=()=>{furnaceShowGray=!furnaceShowGray;renderFurnace()};let rows=profiles.filter(p=>(furnaceSourceFilter==='all'||p.source_id===furnaceSourceFilter)&&(furnaceShowGray||p.admitted));if(!rows.length){list.innerHTML='<div class="empty"><b>熔炉还在升温</b>启用炼丹规则后，达到资格的 IP 会入册；灰名单记录长期未达标候选。</div>';return}list.innerHTML=rows.map(p=>{const cls=phenotypeClass(p.phenotype);return`<div class="furnace-card ${p.admitted?'':'gray'}" data-source="${esc(p.source_id)}" data-ip="${esc(p.ip)}"><div class="furnace-top"><div><div class="furnace-ip">${esc(p.ip)}</div><div class="help">${esc(sourceById(p.source_id)?.name||p.source_id)} · ${esc(p.colo||'—')}</div></div><span class="phenotype ${cls}">${p.admitted?esc(p.phenotype):p.attempts>=28?'长期淘汰':'观察中'}</span></div><div class="furnace-grid"><div><b>${Math.round(p.hit_rate*100)}%</b><span>达成率</span></div><div><b>${fmtNum(p.avg_speed_mb,1)}M</b><span>均速</span></div><div><b>${fmtNum(p.avg_latency_ms,0)}ms</b><span>均延迟</span></div><div><b>${Math.round(p.current_score)}</b><span>当前时段分</span></div></div><div class="maturity"><i style="width:${Math.min(100,p.maturity)}%"></i></div></div>`}).join('');list.querySelectorAll('[data-ip]').forEach(el=>el.onclick=()=>openFurnaceDetail(el.dataset.source,el.dataset.ip))}
+function phenotypeClass(v){if(v==='日间型')return'day';if(v==='夜间型')return'night';if(v==='全天稳定')return'stable';return''}
+function openFurnaceRules(){const rules=new Map((cfg.furnace_rules||[]).map(r=>[r.source_id,clone(r)]));const sourceRows=cfg.sources.map(s=>{const r=rules.get(s.id)||{source_id:s.id,enabled:false,latency_max_ms:50,loss_max:0,speed_min_mb:50,auto_rank:true};rules.set(s.id,r);return`<div class="line-editor" data-rule="${esc(s.id)}"><div class="switch-line"><div><b style="font-size:11px">${esc(s.name||lineTitle(s))}</b><span class="help">${fmtFamily(s.family)} · ${(s.cfst?.colo||[]).join('/')||'不限地区'}</span></div><input class="switch" data-enable type="checkbox" ${r.enabled?'checked':''}></div><div class="thresholds" style="margin-top:8px"><label class="field"><span>炼丹延迟≤ms</span><input data-lat type="number" value="${Number(r.latency_max_ms??50)}"></label><label class="field"><span>炼丹丢包≤</span><input data-loss type="number" step="0.01" min="0" max="1" value="${Number(r.loss_max??0)}"></label><label class="field"><span>炼丹速度≥MB/s</span><input data-speed type="number" step="0.1" value="${Number(r.speed_min_mb??50)}"></label></div><div class="switch-line"><span class="help">允许成熟历史参与日/夜 DNS 排序</span><input class="switch" data-rank type="checkbox" ${r.auto_rank?'checked':''}></div></div>`}).join('');$('#modalRoot').innerHTML=`<div class="overlay" id="furnaceRuleOverlay"><div class="sheet"><div class="sheet-head"><h3>熔炉 · 炼丹资格</h3><button class="sheet-close" data-close>×</button></div><div class="sheet-body"><div class="modal-note">第一次满足资格即“入册”。之后无论变快、变慢、丢包甚至初筛失败，都会继续累计表现；约 28 次观察达到 100% 学习成熟度。</div>${sourceRows}</div><div class="sheet-actions"><button data-close>取消</button><button id="saveFurnaceRules" class="primary">保存规则</button></div></div></div>`;$$('#modalRoot [data-rule]').forEach(el=>{const r=rules.get(el.dataset.rule);el.querySelector('[data-enable]').onchange=e=>r.enabled=e.target.checked;el.querySelector('[data-lat]').oninput=e=>r.latency_max_ms=Math.max(0,Number(e.target.value)||0);el.querySelector('[data-loss]').oninput=e=>r.loss_max=Math.max(0,Math.min(1,Number(e.target.value)||0));el.querySelector('[data-speed]').oninput=e=>r.speed_min_mb=Math.max(0,Number(e.target.value)||0);el.querySelector('[data-rank]').onchange=e=>r.auto_rank=e.target.checked});$$('#modalRoot [data-close]').forEach(b=>b.onclick=closeModal);$('#furnaceRuleOverlay').onclick=e=>{if(e.target.id==='furnaceRuleOverlay')closeModal()};$('#saveFurnaceRules').onclick=async()=>{cfg.furnace_rules=[...rules.values()].filter(r=>r.enabled);if(await saveConfig('炼丹规则已保存')){closeModal();loadFurnace(true)}}}
+async function openFurnaceDetail(sourceId,ip){try{const d=await api(`/api/furnace/detail?source_id=${encodeURIComponent(sourceId)}&ip=${encodeURIComponent(ip)}`),s=d.summary,samples=d.samples||[];$('#modalRoot').innerHTML=`<div class="overlay" id="furnaceDetailOverlay"><div class="sheet"><div class="sheet-head"><h3>${esc(ip)}</h3><button class="sheet-close" data-close>×</button></div><div class="sheet-body"><div class="furnace-detail-summary"><div class="metric"><b>${Math.round(s.hit_rate*100)}%</b><span>达成率 ${s.hits}/${s.attempts}</span></div><div class="metric"><b>${esc(s.phenotype)}</b><span>分型</span></div><div class="metric"><b>${s.maturity}%</b><span>学习成熟度</span></div></div>${chartCard('速度 MB/s',samples,'speed_mb','speed')}${chartCard('延迟 ms',samples,'latency_ms','latency')}${chartCard('丢包 %',samples,'loss','loss',100)}<div class="modal-note">日间分 ${fmtNum(s.day_score,0)} · 夜间分 ${fmtNum(s.night_score,0)} · 最好时段 ${s.best_hour>=0?s.best_hour+':00':'数据不足'} · 最差时段 ${s.worst_hour>=0?s.worst_hour+':00':'数据不足'}</div></div><div class="sheet-actions"><button data-close>关闭</button><button class="primary" id="scanProfileSource">严选该来源</button></div></div></div>`;$$('#modalRoot [data-close]').forEach(b=>b.onclick=closeModal);$('#furnaceDetailOverlay').onclick=e=>{if(e.target.id==='furnaceDetailOverlay')closeModal()};$('#scanProfileSource').onclick=async()=>{await api('/api/run/source?id='+encodeURIComponent(sourceId),{method:'POST'});toast('已启动严选');closeModal()}}catch(e){toast(e.message,true)}}
+function chartCard(title,samples,key,cls,mul=1){const vals=samples.map(x=>Number(x[key]||0)*mul);const times=samples.map(x=>x.time);const svg=sparkSVG(vals,cls);const last=vals.length?vals[vals.length-1]:0;return`<div class="chart-card"><div class="chart-title"><span>${title}</span><span>当前 ${fmtNum(last,key==='loss'?0:1)}</span></div>${svg}<div class="help">${times.length?fmtTime(times[0])+' → '+fmtTime(times[times.length-1]):'暂无历史'}</div></div>`}
+function sparkSVG(vals,cls){if(!vals.length)return'<div class="empty">暂无曲线数据</div>';const w=320,h=92,pad=7,min=Math.min(...vals),max=Math.max(...vals),span=max-min||1;const pts=vals.map((v,i)=>`${pad+(w-2*pad)*(vals.length===1?.5:i/(vals.length-1))},${h-pad-(h-2*pad)*(v-min)/span}`).join(' ');return`<svg class="spark ${cls}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line class="grid" x1="0" y1="23" x2="320" y2="23"/><line class="grid" x1="0" y1="46" x2="320" y2="46"/><line class="grid" x1="0" y1="69" x2="320" y2="69"/><polyline class="line" points="${pts}"/></svg>`}
 
-function phaseLabel(st={}) {
-  const stage = String(st.stage || '').trim();
-  if (stage) return stage;
-  const p = st.progress?.phase;
-  return ({probe:'延迟 / 丢包初筛',region:'地区筛选',speed:'速度决赛',done:'严选完成'})[p] || '等待';
-}
-function progressText(st={}) {
-  const p = st.progress || {};
-  if (!st.running) return `${st.results?.length || 0} 条`;
-  const bits = [phaseLabel(st)];
-  if (p.total > 0) bits.push(`${p.percent || 0}%`, `${p.current || 0}/${p.total}`);
-  return bits.join(' · ');
-}
-function taskProgress(t) {
-  const running = taskLines(t).map(x => runtime.sources?.[x.source.id]).filter(st => st?.running);
-  if (!running.length) return 0;
-  return Math.max(...running.map(st => Number(st.progress?.percent || 0)));
-}
-function fmtNum(v, digits=1) {
-  const n = Number(v || 0);
-  return Number.isFinite(n) ? n.toFixed(digits) : '0';
-}
-function fmtLoss(v) { return `${Math.round(Number(v || 0) * 100)}%`; }
-function observedStatus(r={}, selected=false, running=false) {
-  if (r.qualified && selected) return [running ? '暂列入选' : '入选','selected'];
-  if (r.qualified) return ['合格','ok'];
-  if (!r.speed_tested) return ['待测速','waiting'];
-  return ['未达标','bad'];
-}
+function closeModal(){scanDetailSourceId='';$('#modalRoot').innerHTML=''}
+function switchView(view){currentView=view;const titles={tasks:'域名任务',furnace:'熔炉记录',account:'我的',settings:'设置'};$('#pageTitle').textContent=titles[view]||'BestIP';$$('.view').forEach(v=>v.classList.remove('active'));$$('.nav-item').forEach(v=>v.classList.remove('active'));$(`#view${view[0].toUpperCase()+view.slice(1)}`)?.classList.add('active');$(`.nav-item[data-view="${view}"]`)?.classList.add('active');$('#addTaskBtn').style.display=view==='tasks'?'':'none';if(view==='tasks')renderTasks();if(view==='furnace')loadFurnace(true);if(view==='account')renderProviders();if(view==='settings')renderSettings()}
+async function refreshStatus(immediate=false){clearTimeout(statusTimer);try{runtime=await api('/api/status?ts='+Date.now());if(currentView==='tasks')renderTasks();if(scanDetailSourceId&&$('#scanOverlay'))drawScanDetail();if(currentView==='furnace'&&Date.now()-furnaceLoadedAt>8000)loadFurnace(true)}catch{}const running=Object.values(runtime.sources||{}).some(s=>s.running);statusTimer=setTimeout(()=>refreshStatus(),running?1000:4000)}
 
-function renderTasks() {
-  const list = $('#taskList');
-  const targets = cfg.targets || [];
-  const enabled = targets.filter(t => t.enabled).length;
-  const running = targets.filter(taskRunning).length;
-  const totalResults = (cfg.sources || []).reduce((n,s) => n + resultCountFor(s.id), 0);
-  $('#summary').innerHTML = `
-    <div class="summary-box"><b>${targets.length}</b><span>域名任务</span></div>
-    <div class="summary-box"><b>${running || enabled}</b><span>${running ? '正在运行' : '已启用'}</span></div>
-    <div class="summary-box"><b>${totalResults}</b><span>当前结果</span></div>`;
-
-  if (!targets.length) {
-    list.innerHTML = `<div class="empty"><b>还没有任务</b>一个域名就是一个任务。先添加 DNS 账号，再创建第一个域名。</div>`;
-    return;
-  }
-  list.innerHTML = '';
-  targets.forEach(t => {
-    const lines = taskLines(t);
-    const runningNow = taskRunning(t);
-    const pct = taskProgress(t);
-    const err = taskError(t);
-    const synced = runtime.targets?.[t.id];
-    let stateClass = runningNow ? 'running' : err ? 'bad' : synced?.ok ? 'ok' : '';
-    let stateText = runningNow ? `优选中${pct ? ` ${pct}%` : ''}` : err ? '有错误' : synced?.ok ? '已同步' : '待运行';
-    const chips = [];
-    [...new Set(lines.map(x => x.source.family))].forEach(f => chips.push(`<span class="chip ${f==='ipv6'?'v6':'v4'}">${recordType(f)} ${fmtFamily(f)}</span>`));
-    [...new Set(lines.flatMap(x => x.source.cfst?.colo || []))].slice(0,3).forEach(c => chips.push(`<span class="chip colo">${esc(c)}</span>`));
-    const p = providerById(t.provider_id);
-    if (p) chips.push(`<span class="chip">${esc(p.name || 'Cloudflare')}</span>`);
-
-    const lineRows = lines.map(x => {
-      const src = x.source;
-      const st = runtime.sources?.[src.id] || {};
-      const pg = st.progress || {};
-      const meta = [
-        (src.cfst?.colo || []).join(','),
-        `${x.ref.count || 1} 个`,
-        fmtInterval(src.interval_minutes)
-      ].filter(Boolean).join(' · ');
-      return `<div class="line-status-block" data-source-detail="${esc(src.id)}">
-        <div class="line-row clickable">
-          <span class="line-family">${recordType(src.family)}</span>
-          <span class="line-meta">${esc(src.name || lineTitle(src))}${meta ? ` · ${esc(meta)}` : ''}</span>
-          <span class="line-result">${esc(progressText(st))}</span>
-        </div>
-        ${st.running ? `<div class="progress-track"><i style="width:${Math.max(2,Math.min(100,Number(pg.percent || 0)))}%"></i></div>
-          <div class="progress-mini"><span>${esc(phaseLabel(st))} ${pg.current || 0}${pg.total ? ` / ${pg.total}` : ''}</span><span>合格 ${st.funnel?.speed_passed || 0}</span><span>点此看详情</span></div>` :
-          (st.observed_total ? `<div class="progress-mini"><span>决赛 ${st.funnel?.region_passed || st.observed_total} 个</span><span>速度合格 ${st.funnel?.speed_passed || st.results?.length || 0}</span><span>点此看详情</span></div>` : '')}
-      </div>`;
-    }).join('') || `<div class="line-row"><span class="line-meta">尚未配置 IP 线路</span></div>`;
-
-    const d = document.createElement('article');
-    d.className = `task-card ${t.enabled ? '' : 'disabled'}`;
-    d.innerHTML = `
-      <div class="task-top">
-        <div>
-          <div class="task-domain">${esc(taskHostname(t))}</div>
-          <div class="task-name">${t.name ? `备注 · ${esc(t.name)}` : esc(providerById(t.provider_id)?.name || '')}</div>
-        </div>
-        <div class="status-dot ${stateClass}">${stateText}</div>
-      </div>
-      <div class="chips">${chips.join('')}</div>
-      <div class="line-preview">${lineRows}</div>
-      ${err ? `<div class="help" style="color:#ff8f96;margin-top:8px">${esc(err)}</div>` : ''}
-      <div class="card-actions">
-        <button class="run" data-run>立即优选</button>
-        <button class="sync" data-sync>同步 DNS</button>
-        <button class="more" data-edit>•••</button>
-      </div>`;
-    d.querySelector('[data-run]').onclick = () => runTask(t);
-    d.querySelector('[data-sync]').onclick = () => syncTask(t);
-    d.querySelector('[data-edit]').onclick = () => openTaskEditor(t.id);
-    d.querySelectorAll('[data-source-detail]').forEach(el => el.onclick = () => openScanDetail(el.dataset.sourceDetail));
-    list.appendChild(d);
-  });
-}
-
-function openScanDetail(sourceId) {
-  scanDetailSourceId = sourceId;
-  const src = sourceById(sourceId);
-  const root = $('#modalRoot');
-  root.innerHTML = `<div class="overlay" id="scanOverlay"><div class="sheet scan-sheet">
-    <div class="sheet-head"><div><h3>${esc(src?.name || '扫描详情')}</h3><div class="help">${esc(src?.family || '')} · ${esc((src?.cfst?.colo || []).join(',') || '不限地区')}</div></div><button class="sheet-close" data-close>×</button></div>
-    <div class="sheet-body" id="scanDetailBody"></div>
-  </div></div>`;
-  root.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
-  $('#scanOverlay').onclick = e => { if (e.target.id === 'scanOverlay') closeModal(); };
-  renderScanDetail();
-}
-
-function renderScanDetail() {
-  if (!scanDetailSourceId) return;
-  const body = $('#scanDetailBody');
-  if (!body) return;
-  const src = sourceById(scanDetailSourceId);
-  const st = runtime.sources?.[scanDetailSourceId] || {};
-  const pg = st.progress || {};
-  const f = st.funnel || {};
-  const need = requiredCountForSource(scanDetailSourceId);
-  const logs = st.logs || [];
-  const pct = Number(pg.percent || (st.running ? 0 : st.results?.length ? 100 : 0));
-
-  // Engine already sorts live results, but sort again defensively:
-  // qualified by speed desc -> pending -> speed failures by speed desc.
-  const rows = [...(st.observed || [])].sort((a,b) => {
-    const group = r => r.qualified ? 0 : (!r.speed_tested ? 1 : 2);
-    const ga=group(a), gb=group(b);
-    if (ga !== gb) return ga-gb;
-    if ((ga===0 || ga===2) && Number(a.speed_mb||0)!==Number(b.speed_mb||0)) return Number(b.speed_mb||0)-Number(a.speed_mb||0);
-    return Number(a.latency_ms||999999)-Number(b.latency_ms||999999);
-  });
-
-  let qualifiedIndex = 0;
-  const resultRows = rows.length ? rows.slice(0,500).map(r => {
-    let selected = false;
-    if (r.qualified) {
-      selected = qualifiedIndex < need;
-      qualifiedIndex++;
-    }
-    const [label, cls] = observedStatus(r, selected, !!st.running);
-    return `<div class="scan-result-row ${r.qualified?'is-qualified':''} ${selected?'is-selected':''}">
-      <div class="scan-ip">${esc(r.ip || '')}<span class="scan-badge ${cls}">${label}</span></div>
-      <div class="scan-metrics">
-        <span>${r.latency_ms ? `${fmtNum(r.latency_ms)} ms` : '— ms'}</span>
-        <span>丢包 ${fmtLoss(r.loss)}</span>
-        <span>${r.speed_tested ? `${fmtNum(r.speed_mb,2)} MB/s` : '待测速'}</span>
-        <span>${esc(r.colo || '—')}</span>
-      </div>
-      ${r.reject_reason ? `<div class="scan-reason">${esc(r.reject_reason)}</div>` : ''}
-    </div>`;
-  }).join('') : `<div class="empty mini"><b>还没有决赛 IP</b>${st.running ? '正在做延迟、丢包和地区初筛；淘汰项不会铺满列表，进入速度决赛后会实时显示。' : '点击“立即优选”开始严选。'}</div>`;
-
-  body.innerHTML = `
-    <div class="scan-live-card">
-      <div class="scan-live-head"><div><div class="mini-label">当前阶段</div><b>${esc(phaseLabel(st))}</b></div><span class="scan-live-state ${st.running?'running':st.error?'bad':'ok'}">${st.running?'运行中':st.error?'失败':'完成'}</span></div>
-      <div class="progress-track large"><i style="width:${Math.max(0,Math.min(100,pct))}%"></i></div>
-      <div class="funnel-grid">
-        <div><b>${f.total_candidates || pg.total || 0}</b><span>总候选</span></div>
-        <div><b>${f.responsive || 0}</b><span>可连通</span></div>
-        <div><b>${f.latency_passed || 0}</b><span>延迟通过</span></div>
-        <div><b>${f.loss_passed || 0}</b><span>丢包通过</span></div>
-        <div><b>${f.region_passed || 0}</b><span>地区通过 / 决赛</span></div>
-        <div><b>${f.speed_tested || 0}/${f.region_passed || 0}</b><span>速度已测</span></div>
-        <div><b>${f.speed_passed || 0}</b><span>速度合格</span></div>
-        <div><b>${Math.min(need, Number(f.speed_passed || 0))}/${need}</b><span>${st.running?'暂列入选':'最终入选'}</span></div>
-      </div>
-      <div class="strict-note">严选流程：全量延迟/丢包 → 地区筛选 → 所有幸存 IP 进入速度决赛。延迟、丢包或地区不合格的 IP 直接淘汰，不占用下面列表；速度不达标会保留显示。最终按速度从高到低排序。</div>
-      ${st.error ? `<div class="scan-error">${esc(compactError(st.error))}</div>` : ''}
-    </div>
-
-    <div class="scan-section-head"><b>速度决赛明细</b><span>合格实时置顶 · 按速度降序 · 目标 ${need} 个</span></div>
-    <div class="scan-results">${resultRows}</div>
-
-    <details class="scan-log-box" open>
-      <summary>实时日志 · 最近 ${logs.length} 条</summary>
-      <pre>${esc(logs.join('\n') || '等待日志…')}</pre>
-    </details>`;
-}
-
-async function runTask(t) {
-  const lines = taskLines(t);
-  if (!t.enabled) return toast('这个任务当前已停用', true);
-  if (!lines.length) return toast('请先添加至少一条 IP 线路', true);
-  try {
-    for (const x of lines) await api('/api/run/source?id=' + encodeURIComponent(x.source.id), {method:'POST'});
-    toast(`已启动 ${lines.length} 条线路，完成后会自动同步 DNS`);
-    setTimeout(refreshStatus, 500);
-  } catch (e) { toast(e.message, true); }
-}
-
-async function syncTask(t) {
-  try {
-    await api('/api/sync/target?id=' + encodeURIComponent(t.id), {method:'POST'});
-    toast('DNS 同步成功');
-    refreshStatus();
-  } catch (e) { toast(`同步失败：${e.message}`, true); }
-}
-
-async function refreshStatus() {
-  try {
-    runtime = await api('/api/status');
-    if (currentView === 'tasks') renderTasks();
-    if (scanDetailSourceId) renderScanDetail();
-  } catch (_) {}
-}
-
-function renderProviders() {
-  const box = $('#providerList');
-  const arr = cfg.providers || [];
-  if (!arr.length) {
-    box.innerHTML = `<div class="empty"><b>还没有 DNS 账号</b>先添加 Cloudflare Zone，之后新建域名时直接下拉选择。</div>`;
-    return;
-  }
-  box.innerHTML = '';
-  arr.forEach(p => {
-    const used = (cfg.targets || []).filter(t => t.provider_id === p.id).length;
-    const d = document.createElement('div');
-    d.className = 'provider-card';
-    d.innerHTML = `<div class="provider-head">
-      <div><b>${esc(p.name || 'Cloudflare')}</b><div class="provider-meta">${esc(normalizeZoneDomain(p.zone_domain) || '未设置主域名')} · ${providerAuthMode(p)==='global_api_key'?'Email + Global API Key':'API Token'} · ${used} 个任务</div></div>
-      <div class="provider-actions"><button data-edit>编辑</button><button data-del>删除</button></div>
-    </div>`;
-    d.querySelector('[data-edit]').onclick = () => openProviderEditor(p.id);
-    d.querySelector('[data-del]').onclick = () => deleteProvider(p.id);
-    box.appendChild(d);
-  });
-}
-
-function mask(v) {
-  v = String(v || '');
-  if (!v) return '未配置';
-  if (v.length < 10) return v;
-  return `${v.slice(0,5)}…${v.slice(-4)}`;
-}
-
-function renderSettings() {
-  const panel = $('#settingsPanel');
-  const updateReady = !!buildInfo.web_update_ready;
-  const available = !!updateCheck?.update_available;
-  const latest = updateCheck?.latest_commit ? shortCommit(updateCheck.latest_commit) : '未检查';
-  panel.innerHTML = `
-    <div class="settings-card update-card">
-      <div class="update-head">
-        <div>
-          <div class="mini-label">当前版本</div>
-          <div class="version-title">${esc(buildInfo.version || 'dev')} <span>${esc(shortCommit(buildInfo.commit))}</span></div>
-          <div class="help">构建：${esc(buildInfo.built_at || 'unknown')} · 最新 main：${esc(latest)}</div>
-        </div>
-        <span class="update-state ${available?'available':''}">${available?'有新版本':'版本状态'}</span>
-      </div>
-      <div id="updateMessage" class="modal-note">${updateReady ? '已启用 Web 一键更新。更新时页面会短暂断开并自动恢复。' : '当前未挂载 Docker Socket，只能检查版本；换用新版 Compose 后即可一键更新。'}</div>
-      <div class="grid2 update-actions">
-        <button id="checkUpdateBtn" class="ghost">检查更新</button>
-        <button id="applyUpdateBtn" class="primary" ${updateReady?'':'disabled'}>${available?'更新到最新版':'重新拉取最新版'}</button>
-      </div>
-    </div>
-    <div class="settings-card">
-      <div class="settings-row"><label>最大并发测速任务</label><input id="setConcurrency" type="number" min="1" max="64" value="${Number(cfg.max_concurrency || 2)}"></div>
-      <div class="help">建议 1–3。修改后保存并重启容器，新的任务槽数量才会完全生效。</div>
-      <button id="saveGlobal" class="primary compact" style="margin-top:12px">保存设置</button>
-    </div>
-    <div class="settings-card">
-      <details>
-        <summary>高级 / 调试</summary>
-        <div class="field" style="margin-top:12px"><span>监听地址</span><input id="setListen" value="${esc(cfg.listen || ':8080')}"></div>
-        <div class="help">日常不要修改监听地址。下面的完整 JSON 仅用于备份或故障排查。</div>
-        <textarea id="rawConfig" class="raw">${esc(JSON.stringify(cfg,null,2))}</textarea>
-        <div class="grid2" style="margin-top:9px"><button id="copyRaw" class="ghost">复制 JSON</button><button id="applyRaw" class="danger-btn">应用 JSON</button></div>
-      </details>
-    </div>`;
-  $('#checkUpdateBtn').onclick = checkForUpdate;
-  $('#applyUpdateBtn').onclick = applyWebUpdate;
-  $('#saveGlobal').onclick = async () => {
-    cfg.max_concurrency = Math.max(1, Number($('#setConcurrency').value) || 2);
-    cfg.listen = $('#setListen')?.value.trim() || cfg.listen || ':8080';
-    await saveConfig('全局设置已保存');
-  };
-  $('#copyRaw').onclick = async () => {
-    try { await navigator.clipboard.writeText($('#rawConfig').value); toast('JSON 已复制'); } catch { toast('浏览器不允许复制', true); }
-  };
-  $('#applyRaw').onclick = async () => {
-    try {
-      const next = JSON.parse($('#rawConfig').value);
-      cfg = next;
-      cfg.providers ||= []; cfg.sources ||= []; cfg.targets ||= [];
-      await saveConfig('JSON 已应用');
-      renderAll();
-    } catch (e) { toast(e.message, true); }
-  };
-}
-
-async function checkForUpdate() {
-  const msg = $('#updateMessage');
-  if (msg) msg.textContent = '正在检查 GitHub main…';
-  try {
-    updateCheck = await api('/api/update/check?ts=' + Date.now());
-    buildInfo = updateCheck.current || buildInfo;
-    renderVersionBadge();
-    renderSettings();
-    toast(updateCheck.update_available ? '发现新版本' : '当前已是最新 main');
-  } catch (e) {
-    if (msg) msg.textContent = `检查失败：${e.message}`;
-    toast(`检查更新失败：${e.message}`, true);
-  }
-}
-
-async function applyWebUpdate() {
-  if (!buildInfo.web_update_ready) return toast('请先换用启用 Docker Socket 的新版 Compose', true);
-  if (!confirm('更新会拉取 latest 镜像并重建 BestIP 容器，页面会短暂断开。继续吗？')) return;
-  const oldCommit = String(buildInfo.commit || '');
-  const btn = $('#applyUpdateBtn');
-  if (btn) { btn.disabled = true; btn.textContent = '正在拉取…'; }
-  try {
-    await api('/api/update/apply', {method:'POST'});
-    toast('已启动更新，等待服务重新上线');
-    waitForUpdatedService(oldCommit);
-  } catch (e) {
-    toast(`更新失败：${e.message}`, true);
-    renderSettings();
-  }
-}
-
-function waitForUpdatedService(oldCommit) {
-  let tries = 0;
-  const timer = setInterval(async () => {
-    tries++;
-    try {
-      const next = await api('/api/version?ts=' + Date.now());
-      if (next?.commit && (next.commit !== oldCommit || tries > 5)) {
-        clearInterval(timer);
-        buildInfo = next;
-        renderVersionBadge();
-        toast(`更新完成：${next.version} · ${shortCommit(next.commit)}`);
-        setTimeout(() => location.reload(), 900);
-      }
-    } catch (_) {}
-    if (tries >= 60) {
-      clearInterval(timer);
-      toast('更新等待超时，请刷新页面确认版本', true);
-      renderSettings();
-    }
-  }, 2500);
-}
-
-async function saveConfig(okText='已保存') {
-  try {
-    await api('/api/config', {method:'PUT', body:JSON.stringify(cfg)});
-    toast(okText);
-    renderAll();
-    return true;
-  } catch (e) {
-    toast(`保存失败：${e.message}`, true);
-    return false;
-  }
-}
-
-function openTaskEditor(targetId='') {
-  if (!(cfg.providers || []).length) {
-    toast('请先在“我的”里添加一个 DNS 账号', true);
-    switchView('account');
-    return;
-  }
-  const existing = targetId ? cfg.targets.find(t => t.id === targetId) : null;
-  const t = existing ? clone(existing) : {
-    id:uid('task'), name:'', enabled:true,
-    provider_id:cfg.providers[0].id, prefix:'', hostname:'', ttl:60, proxied:false, sources:[]
-  };
-  t.prefix = taskPrefixValue(t, providerById(t.provider_id));
-  const drafts = existing ? taskLines(existing).map(x => ({
-    originalSourceId:x.source.id,
-    ref:clone(x.ref),
-    source:clone(x.source),
-    shared:sourceUseCount(x.source.id, existing.id) > 0
-  })) : [newLineDraft('ipv4')];
-
-  const root = $('#modalRoot');
-  root.innerHTML = `<div class="overlay" id="taskOverlay"><div class="sheet">
-    <div class="sheet-head"><h3>${existing ? '编辑域名任务' : '新建域名任务'}</h3><button class="sheet-close" data-close>×</button></div>
-    <div class="sheet-body">
-      <div class="grid2">
-        <label class="field"><span>DNS 账号</span><select id="taskProvider">${providerOptions(t.provider_id)}</select></label>
-        <label class="field"><span>域名前缀</span><input id="taskPrefix" value="${esc(t.prefix || '')}" placeholder="例如 v4 / nrtv4 / @" autocomplete="off"></label>
-      </div>
-      <div id="taskDomainPreview" class="domain-preview"></div>
-      <label class="field"><span>备注（可选）</span><input id="taskName" value="${esc(t.name || '')}" placeholder="例如 日本 NRT 严选、移动线路"></label>
-      <div class="toggle-line"><div><b style="font-size:13px">启用任务</b><div class="help">关闭后不会定时优选</div></div><input id="taskEnabled" class="switch" type="checkbox" ${t.enabled?'checked':''}></div>
-      <div class="mini-label" style="margin-top:10px">IP 线路</div>
-      <div class="modal-note">一条线路就是一组独立的 IP 段和筛选规则。一个域名可以同时添加 IPv4、IPv6、NRT IPv4 等任意组合。</div>
-      <div id="lineEditors"></div>
-      <button id="addLineBtn" class="add-line">＋ 添加一条线路</button>
-      <details class="advanced">
-        <summary>DNS 高级设置</summary>
-        <div class="grid2">
-          <label class="field"><span>TTL</span><input id="taskTTL" type="number" min="1" value="${Number(t.ttl || 60)}"></label>
-          <label class="field"><span>Cloudflare 代理</span><select id="taskProxied"><option value="false" ${!t.proxied?'selected':''}>关闭（推荐）</option><option value="true" ${t.proxied?'selected':''}>开启</option></select></label>
-        </div>
-      </details>
-      ${existing ? `<div class="danger-zone"><button id="deleteTaskBtn" class="danger-btn">删除这个域名任务</button></div>` : ''}
-    </div>
-    <div class="sheet-actions"><button data-close>取消</button><button id="saveTaskBtn" class="primary">保存任务</button></div>
-  </div></div>`;
-
-  function drawLines() {
-    const box = $('#lineEditors');
-    box.innerHTML = '';
-    drafts.forEach((d,i) => {
-      d.source.cfst ||= clone(DEFAULT_CFST);
-      const s = d.source;
-      const ref = d.ref;
-      const e = document.createElement('div');
-      e.className = 'line-editor';
-      e.innerHTML = `
-        <div class="line-editor-head"><div class="line-editor-title">线路 ${i+1}${d.shared?' · 原配置曾被其他任务共享':''}</div><button class="remove-line" data-remove>删除</button></div>
-        <div class="grid2">
-          <label class="field"><span>线路名称</span><input data-name value="${esc(s.name || '')}" placeholder="例如 NRT IPv4"></label>
-          <label class="field"><span>协议</span><select data-family><option value="ipv4" ${s.family==='ipv4'?'selected':''}>IPv4 / A</option><option value="ipv6" ${s.family==='ipv6'?'selected':''}>IPv6 / AAAA</option></select></label>
-        </div>
-        <label class="field"><span>IP 段 / IP 源</span><textarea data-inputs placeholder="每行一个，可填 URL、CIDR 或单个 IP">${esc((s.inputs || []).join('\n'))}</textarea></label>
-        <div class="grid3">
-          <label class="field"><span>结果地区（可空）</span><input data-colo value="${esc((s.cfst.colo || []).join(','))}" placeholder="NRT"><small>先测速，再按实际 Colo 结果筛选；不会再用 HTTPing 提前淘汰。</small></label>
-          <label class="field"><span>写入数量</span><input data-count type="number" min="1" max="100" value="${Number(ref.count || 5)}"></label>
-          <label class="field"><span>自动周期</span><select data-interval>
-            ${intervalOptions(s.interval_minutes)}
-          </select></label>
-        </div>
-        <details class="advanced"><summary>测速高级参数</summary>
-          <div class="grid2">
-            <label class="field"><span>最低速度 MB/s</span><input data-speed type="number" step="0.1" min="0" value="${Number(s.cfst.speed_min_mb ?? 5)}"></label>
-            <label class="field"><span>延迟上限 ms</span><input data-latency type="number" step="1" min="0" value="${Number(s.cfst.latency_max_ms ?? 200)}"></label>
-          </div>
-          <div class="grid2">
-            <label class="field"><span>丢包上限 0–1</span><input data-loss type="number" step="0.01" min="0" max="1" value="${Number(s.cfst.loss_max ?? .2)}"></label>
-            <label class="field"><span>结果缓存数量</span><input data-keep type="number" min="1" value="${Number(s.keep_results || 50)}"></label>
-          </div>
-          <label class="field"><span>测速 URL</span><input data-url value="${esc(s.cfst.url || DEFAULT_CFST.url)}"></label>
-          <div class="grid2">
-            <label class="field"><span>HTTPing（无地区筛选时）</span><select data-httping><option value="true" ${s.cfst.httping?'selected':''}>开启</option><option value="false" ${!s.cfst.httping?'selected':''}>关闭</option></select></label>
-            <label class="field"><span>All IP</span><select data-allip><option value="false" ${!s.cfst.all_ip?'selected':''}>关闭</option><option value="true" ${s.cfst.all_ip?'selected':''}>开启</option></select></label>
-          </div>
-        </details>`;
-      e.querySelector('[data-remove]').onclick = () => { drafts.splice(i,1); drawLines(); };
-      e.querySelector('[data-name]').oninput = ev => s.name = ev.target.value;
-      e.querySelector('[data-family]').onchange = ev => s.family = ev.target.value;
-      e.querySelector('[data-inputs]').oninput = ev => s.inputs = splitLines(ev.target.value);
-      e.querySelector('[data-colo]').oninput = ev => s.cfst.colo = splitComma(ev.target.value).map(x => x.toUpperCase());
-      e.querySelector('[data-count]').oninput = ev => ref.count = Math.max(1, Number(ev.target.value) || 1);
-      e.querySelector('[data-interval]').onchange = ev => s.interval_minutes = Number(ev.target.value);
-      e.querySelector('[data-speed]').oninput = ev => s.cfst.speed_min_mb = Number(ev.target.value) || 0;
-      e.querySelector('[data-latency]').oninput = ev => s.cfst.latency_max_ms = Number(ev.target.value) || 0;
-      e.querySelector('[data-loss]').oninput = ev => s.cfst.loss_max = Number(ev.target.value) || 0;
-      e.querySelector('[data-keep]').oninput = ev => s.keep_results = Math.max(1, Number(ev.target.value) || 50);
-      e.querySelector('[data-url]').oninput = ev => s.cfst.url = ev.target.value.trim();
-      e.querySelector('[data-httping]').onchange = ev => s.cfst.httping = ev.target.value === 'true';
-      e.querySelector('[data-allip]').onchange = ev => s.cfst.all_ip = ev.target.value === 'true';
-      box.appendChild(e);
-    });
-  }
-  drawLines();
-  $('#addLineBtn').onclick = () => {
-    const usedFamilies = drafts.map(d => d.source.family);
-    drafts.push(newLineDraft(usedFamilies.includes('ipv4') && !usedFamilies.includes('ipv6') ? 'ipv6' : 'ipv4'));
-    drawLines();
-  };
-  const updateTaskDomainPreview = () => {
-    const provider = providerById($('#taskProvider').value);
-    const prefix = $('#taskPrefix').value.trim().toLowerCase();
-    const hostname = composeHostname(provider, prefix);
-    const domain = normalizeZoneDomain(provider?.zone_domain || '');
-    $('#taskDomainPreview').innerHTML = hostname
-      ? `<b>最终域名</b><span>${esc(hostname)}</span>`
-      : `<b>最终域名</b><span>${domain ? '请输入前缀；根域名请填 @' : '请先在 DNS 账号中设置主域名'}</span>`;
-  };
-  $('#taskProvider').onchange = updateTaskDomainPreview;
-  $('#taskPrefix').oninput = updateTaskDomainPreview;
-  updateTaskDomainPreview();
-
-  root.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
-  $('#taskOverlay').onclick = e => { if (e.target.id === 'taskOverlay') closeModal(); };
-  $('#saveTaskBtn').onclick = async () => {
-    t.provider_id = $('#taskProvider').value;
-    const provider = providerById(t.provider_id);
-    t.prefix = $('#taskPrefix').value.trim().toLowerCase();
-    t.hostname = composeHostname(provider, t.prefix);
-    t.name = $('#taskName').value.trim();
-    t.enabled = $('#taskEnabled').checked;
-    t.ttl = Math.max(1, Number($('#taskTTL').value) || 60);
-    t.proxied = $('#taskProxied').value === 'true';
-    if (!t.provider_id) return toast('请选择 DNS 账号', true);
-    if (!normalizeZoneDomain(provider?.zone_domain || '')) return toast('这个 DNS 账号还没有设置主域名 / Zone', true);
-    if (!t.prefix) return toast('请填写域名前缀；根域名请填 @', true);
-    if (!t.hostname) return toast('无法生成最终域名', true);
-    if (!drafts.length) return toast('至少保留一条 IP 线路', true);
-    if (drafts.some(d => !(d.source.inputs || []).length)) return toast('每条线路至少填写一个 IP 段或 IP 源', true);
-    if (await persistTask(t, drafts, existing)) closeModal();
-  };
-  if (existing) $('#deleteTaskBtn').onclick = async () => {
-    if (!confirm(`删除 ${taskHostname(existing)}？\n同时会删除仅属于这个任务的 IP 线路。`)) return;
-    deleteTask(existing.id);
-    if (await saveConfig('任务已删除')) closeModal();
-  };
-}
-
-function newLineDraft(family='ipv4') {
-  return {
-    originalSourceId:'', shared:false,
-    ref:{source_id:'',count:5},
-    source:{
-      id:uid('line'), name:family === 'ipv6' ? 'IPv6' : 'IPv4', enabled:true, family,
-      inputs:[], interval_minutes:360, keep_results:50, cfst:clone(DEFAULT_CFST)
-    }
-  };
-}
-
-async function persistTask(t, drafts, existing) {
-  const oldSourceIds = existing ? (existing.sources || []).map(r => r.source_id) : [];
-  const nextRefs = [];
-  const nextSourceIds = new Set();
-
-  for (const d of drafts) {
-    const s = clone(d.source);
-    s.enabled = t.enabled;
-    s.cfst = {...clone(DEFAULT_CFST), ...(s.cfst || {})};
-    s.inputs = (s.inputs || []).map(x => x.trim()).filter(Boolean);
-    s.cfst.colo = (s.cfst.colo || []).map(x => String(x).trim().toUpperCase()).filter(Boolean);
-    if (!s.name.trim()) s.name = lineTitle(s);
-
-    let id = d.originalSourceId || s.id || uid('line');
-    if (d.shared) id = uid('line');
-    s.id = id;
-    nextSourceIds.add(id);
-    const idx = cfg.sources.findIndex(x => x.id === id);
-    if (idx >= 0) cfg.sources[idx] = s; else cfg.sources.push(s);
-    nextRefs.push({source_id:id, count:Math.max(1, Number(d.ref.count) || 1)});
-  }
-
-  // Remove old source records only when no other target needs them and they are no longer used by this task.
-  for (const oldId of oldSourceIds) {
-    if (!nextSourceIds.has(oldId) && sourceUseCount(oldId, existing?.id || '') === 0) {
-      cfg.sources = cfg.sources.filter(s => s.id !== oldId);
-    }
-  }
-  t.sources = nextRefs;
-  const ti = cfg.targets.findIndex(x => x.id === t.id);
-  if (ti >= 0) cfg.targets[ti] = t; else cfg.targets.push(t);
-  return await saveConfig(existing ? '任务已更新' : '任务已创建');
-}
-
-function deleteTask(id) {
-  const t = cfg.targets.find(x => x.id === id);
-  if (!t) return;
-  const refs = (t.sources || []).map(r => r.source_id);
-  cfg.targets = cfg.targets.filter(x => x.id !== id);
-  for (const sid of refs) {
-    const stillUsed = cfg.targets.some(x => (x.sources || []).some(r => r.source_id === sid));
-    if (!stillUsed) cfg.sources = cfg.sources.filter(s => s.id !== sid);
-  }
-}
-
-function providerOptions(selected) {
-  return (cfg.providers || []).map(p => `<option value="${esc(p.id)}" ${p.id===selected?'selected':''}>${esc(p.name || p.id)}</option>`).join('');
-}
-function intervalOptions(selected) {
-  const opts = [[0,'手动'],[180,'每 3 小时'],[360,'每 6 小时'],[720,'每 12 小时'],[1440,'每天']];
-  if (selected && !opts.some(x => x[0] === Number(selected))) opts.push([Number(selected),`${selected} 分钟`]);
-  return opts.map(([v,n]) => `<option value="${v}" ${Number(selected)===v?'selected':''}>${n}</option>`).join('');
-}
-function splitLines(v) { return String(v || '').split(/\n+/).map(x => x.trim()).filter(Boolean); }
-function splitComma(v) { return String(v || '').split(',').map(x => x.trim()).filter(Boolean); }
-
-function openProviderEditor(providerId='') {
-  const existing = providerId ? cfg.providers.find(p => p.id === providerId) : null;
-  const p = existing ? clone(existing) : {
-    id:uid('cf'), name:'Cloudflare', type:'cloudflare',
-    zone_id:'', zone_domain:'', auth_mode:'api_token',
-    api_token:'', email:'', api_key:''
-  };
-  p.auth_mode = providerAuthMode(p);
-
-  const root = $('#modalRoot');
-  root.innerHTML = `<div class="overlay" id="providerOverlay"><div class="sheet" style="max-width:580px">
-    <div class="sheet-head"><h3>${existing?'编辑 DNS 账号':'添加 DNS 账号'}</h3><button class="sheet-close" data-close>×</button></div>
-    <div class="sheet-body">
-      <label class="field"><span>名称</span><input id="providerName" value="${esc(p.name || 'Cloudflare')}" placeholder="例如 Cloudflare 主账号"></label>
-      <label class="field"><span>主域名 / Zone</span><input id="providerDomain" value="${esc(p.zone_domain || '')}" placeholder="例如 629717.xyz" autocomplete="off"></label>
-      <label class="field"><span>Zone ID</span><input id="providerZone" value="${esc(p.zone_id || '')}" autocomplete="off"></label>
-
-      <label class="field"><span>认证方式</span><select id="providerAuthMode">
-        <option value="api_token" ${p.auth_mode==='api_token'?'selected':''}>API Token（推荐，不需要邮箱）</option>
-        <option value="global_api_key" ${p.auth_mode==='global_api_key'?'selected':''}>Email + Global API Key（兼容旧 BestIP）</option>
-      </select></label>
-
-      <div id="providerTokenBox">
-        <label class="field"><span>API Token</span><input id="providerToken" type="password" value="${esc(p.api_token || '')}" autocomplete="new-password" placeholder="Cloudflare API Token"></label>
-        <div class="modal-note">API Token 不需要邮箱。建议权限至少包含该 Zone 的 <b>Zone:Read</b> 与 <b>DNS:Edit</b>。</div>
-      </div>
-
-      <div id="providerGlobalKeyBox">
-        <label class="field"><span>Cloudflare 账号邮箱</span><input id="providerEmail" type="email" value="${esc(p.email || '')}" autocomplete="email" placeholder="your@email.com"></label>
-        <label class="field"><span>Global API Key</span><input id="providerAPIKey" type="password" value="${esc(p.api_key || '')}" autocomplete="new-password" placeholder="Global API Key"></label>
-        <div class="modal-note">这是原 BestIP 的认证方式：请求会使用 <b>X-Auth-Email + X-Auth-Key</b>。</div>
-      </div>
-
-      <div class="modal-note">主域名只在 DNS 账号里配置一次。以后任务只填前缀，例如 <b>v4</b> → <b>v4.${esc(p.zone_domain || '629717.xyz')}</b>；根域名使用 <b>@</b>。</div>
-    </div>
-    <div class="sheet-actions provider-sheet-actions">
-      <button data-close>取消</button>
-      <button id="testProviderBtn" class="ghost">测试连接</button>
-      <button id="saveProviderBtn" class="primary">保存账号</button>
-    </div>
-  </div></div>`;
-
-  function readProviderForm() {
-    p.name = $('#providerName').value.trim() || 'Cloudflare';
-    p.zone_domain = normalizeZoneDomain($('#providerDomain').value);
-    p.zone_id = $('#providerZone').value.trim();
-    p.auth_mode = $('#providerAuthMode').value;
-    p.api_token = $('#providerToken').value.trim();
-    p.email = $('#providerEmail').value.trim();
-    p.api_key = $('#providerAPIKey').value.trim();
-    return p;
-  }
-  function validateProviderForm() {
-    readProviderForm();
-    if (!p.zone_domain) return '请填写主域名 / Zone，例如 629717.xyz';
-    if (!p.zone_id) return '请填写 Zone ID';
-    if (p.auth_mode === 'global_api_key') {
-      if (!p.email || !p.api_key) return 'Global API Key 模式需要同时填写邮箱和 Global API Key';
-    } else if (!p.api_token) {
-      return 'API Token 模式需要填写 API Token';
-    }
-    return '';
-  }
-  function drawAuthMode() {
-    const legacy = $('#providerAuthMode').value === 'global_api_key';
-    $('#providerTokenBox').style.display = legacy ? 'none' : '';
-    $('#providerGlobalKeyBox').style.display = legacy ? '' : 'none';
-  }
-
-  $('#providerAuthMode').onchange = drawAuthMode;
-  drawAuthMode();
-
-  root.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
-  $('#providerOverlay').onclick = e => { if (e.target.id === 'providerOverlay') closeModal(); };
-
-  $('#testProviderBtn').onclick = async () => {
-    const err = validateProviderForm();
-    if (err) return toast(err, true);
-    const btn = $('#testProviderBtn');
-    btn.disabled = true;
-    btn.textContent = '测试中…';
-    try {
-      const r = await api('/api/provider/test', {method:'POST', body:JSON.stringify(readProviderForm())});
-      toast(r.message || 'Cloudflare 连接正常');
-    } catch (e) {
-      toast(e.message, true);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '测试连接';
-    }
-  };
-
-  $('#saveProviderBtn').onclick = async () => {
-    const err = validateProviderForm();
-    if (err) return toast(err, true);
-    readProviderForm();
-    const i = cfg.providers.findIndex(x => x.id === p.id);
-    if (i >= 0) cfg.providers[i] = p; else cfg.providers.push(p);
-    if (await saveConfig(existing ? 'DNS 账号已更新' : 'DNS 账号已添加')) closeModal();
-  };
-}
-
-async function deleteProvider(id) {
-  const p = providerById(id);
-  const used = (cfg.targets || []).filter(t => t.provider_id === id);
-  if (used.length) return toast(`还有 ${used.length} 个域名任务正在使用这个账号`, true);
-  if (!confirm(`删除 DNS 账号“${p?.name || id}”？`)) return;
-  cfg.providers = cfg.providers.filter(x => x.id !== id);
-  await saveConfig('DNS 账号已删除');
-}
-
-function closeModal() { scanDetailSourceId = ''; $('#modalRoot').innerHTML = ''; }
-
-function switchView(view) {
-  currentView = view;
-  const titles = {tasks:'域名任务',account:'我的',settings:'设置'};
-  $('#pageTitle').textContent = titles[view] || 'BestIP';
-  $$('.view').forEach(v => v.classList.remove('active'));
-  $$('.nav-item').forEach(v => v.classList.remove('active'));
-  $(`#view${view[0].toUpperCase()+view.slice(1)}`)?.classList.add('active');
-  $(`.nav-item[data-view="${view}"]`)?.classList.add('active');
-  $('#addTaskBtn').style.display = view === 'tasks' ? '' : 'none';
-  if (view === 'tasks') renderTasks();
-  if (view === 'account') renderProviders();
-  if (view === 'settings') renderSettings();
-}
-
-$$('.nav-item').forEach(b => b.onclick = () => switchView(b.dataset.view));
-$('#addTaskBtn').onclick = () => openTaskEditor();
-$('#addProviderBtn').onclick = () => openProviderEditor();
-$('#refreshBtn').onclick = async () => { await refreshStatus(); toast('已刷新'); };
-
+$$('.nav-item').forEach(b=>b.onclick=()=>switchView(b.dataset.view));$('#addTaskBtn').onclick=()=>openTaskEditor();$('#addProviderBtn').onclick=()=>openProviderEditor();$('#furnaceRuleBtn').onclick=openFurnaceRules;$('#refreshBtn').onclick=async()=>{await refreshStatus(true);if(currentView==='furnace')await loadFurnace(true);toast('已刷新')};
 load();

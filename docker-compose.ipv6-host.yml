@@ -1,0 +1,30 @@
+services:
+  bestip-manager:
+    image: ghcr.io/honghanh691913-glitch/cloudflare-bestip:latest
+    container_name: bestip-manager
+    restart: unless-stopped
+
+    # 可选 IPv6 兼容模式：直接复用飞牛宿主机网络栈。
+    # 仅当 Web / Docker 日志明确提示“容器没有可用 IPv6 出站路由”时再改用此文件。
+    network_mode: host
+
+    environment:
+      TZ: "Asia/Shanghai"
+      BESTIP_LISTEN: ":18080"
+      BESTIP_WEB_USER: "admin"
+      BESTIP_WEB_PASS: "change-me"
+      BESTIP_CONFIG: "/data/config.json"
+      BESTIP_CONTAINER_NAME: "bestip-manager"
+      BESTIP_UPDATE_IMAGE: "ghcr.io/honghanh691913-glitch/cloudflare-bestip:latest"
+
+    volumes:
+      - ./bestip-manager-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    stop_grace_period: 20s

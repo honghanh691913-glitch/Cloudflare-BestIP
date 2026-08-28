@@ -12,6 +12,7 @@ import (
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/buildinfo"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/engine"
+	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/furnace"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/server"
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/updater"
 )
@@ -36,7 +37,11 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	eng := engine.NewManager()
-	app := server.New(store, eng)
+	furnaceStore, err := furnace.New(furnace.DefaultPath(cfgPath))
+	if err != nil {
+		log.Fatalf("furnace: %v", err)
+	}
+	app := server.New(store, eng, furnaceStore)
 	cfg := store.Get()
 	if listen := os.Getenv("BESTIP_LISTEN"); listen != "" {
 		cfg.Listen = listen

@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#0b0f14">
+  <meta name="theme-color" content="#090d13">
   <title>BestIP</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div>
+      <div class="brand-block">
         <div class="eyebrow">BESTIP MANAGER</div>
         <h1 id="pageTitle">域名任务</h1>
       </div>
@@ -26,23 +26,27 @@
         <div id="taskList" class="task-list"></div>
       </section>
 
+      <section id="viewFurnace" class="view">
+        <div class="section-head compact-head">
+          <div><h2>熔炉</h2><p>把每次严选变成长期学习数据。</p></div>
+          <button id="furnaceRuleBtn" class="primary compact">炼丹规则</button>
+        </div>
+        <div id="furnaceHero"></div>
+        <div id="furnaceFilters"></div>
+        <div id="furnaceList" class="furnace-list"></div>
+      </section>
+
       <section id="viewAccount" class="view">
-        <div class="section-head">
-          <div>
-            <h2>DNS 账号</h2>
-            <p>账号只配置一次，新建域名任务时直接选择。</p>
-          </div>
+        <div class="section-head compact-head">
+          <div><h2>DNS 账号</h2><p>Zone 与认证只配置一次。</p></div>
           <button id="addProviderBtn" class="primary compact">＋ 添加</button>
         </div>
         <div id="providerList" class="stack"></div>
       </section>
 
       <section id="viewSettings" class="view">
-        <div class="section-head">
-          <div>
-            <h2>设置</h2>
-            <p>这里只保留全局参数，日常基本不用动。</p>
-          </div>
+        <div class="section-head compact-head">
+          <div><h2>设置</h2><p>全局测速源、健康检查和更新。</p></div>
         </div>
         <div id="settingsPanel"></div>
       </section>
@@ -50,6 +54,7 @@
 
     <nav class="bottom-nav" aria-label="主导航">
       <button class="nav-item active" data-view="tasks"><span>◉</span><b>任务</b></button>
+      <button class="nav-item" data-view="furnace"><span>◇</span><b>熔炉</b></button>
       <button class="nav-item" data-view="account"><span>◎</span><b>我的</b></button>
       <button class="nav-item" data-view="settings"><span>⚙</span><b>设置</b></button>
     </nav>
@@ -57,7 +62,6 @@
 
   <div id="modalRoot"></div>
   <div id="toast" class="toast"></div>
-
   <script src="/app.js"></script>
 </body>
 </html>

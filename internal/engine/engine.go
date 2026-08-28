@@ -56,31 +56,33 @@ type FunnelStats struct {
 }
 
 type SourceStatus struct {
-	SourceID      string       `json:"source_id"`
-	Running       bool         `json:"running"`
-	Stage         string       `json:"stage"`
-	Error         string       `json:"error,omitempty"`
-	StartedAt     time.Time    `json:"started_at,omitempty"`
-	EndedAt       time.Time    `json:"ended_at,omitempty"`
-	LastUpdate    time.Time    `json:"last_update,omitempty"`
-	InputItems    int          `json:"input_items"`
-	ObservedTotal int          `json:"observed_total"`
-	Progress      ScanProgress `json:"progress"`
-	Funnel        FunnelStats  `json:"funnel"`
-	Results       []Result     `json:"results"`
-	Observed      []Result     `json:"observed"`
-	Logs          []string     `json:"logs"`
+	SourceID       string       `json:"source_id"`
+	Running        bool         `json:"running"`
+	Stage          string       `json:"stage"`
+	Error          string       `json:"error,omitempty"`
+	StartedAt      time.Time    `json:"started_at,omitempty"`
+	EndedAt        time.Time    `json:"ended_at,omitempty"`
+	LastUpdate     time.Time    `json:"last_update,omitempty"`
+	InputItems     int          `json:"input_items"`
+	CandidateCount int          `json:"candidate_count"`
+	ObservedTotal  int          `json:"observed_total"`
+	Progress       ScanProgress `json:"progress"`
+	Funnel         FunnelStats  `json:"funnel"`
+	Results        []Result     `json:"results"`
+	Observed       []Result     `json:"observed"`
+	Logs           []string     `json:"logs"`
 }
 
 type Manager struct {
 	mu      sync.RWMutex
 	status  map[string]SourceStatus
+	history map[string][]Result
 	runMu   sync.Mutex
 	running map[string]bool
 }
 
 func NewManager() *Manager {
-	return &Manager{status: map[string]SourceStatus{}, running: map[string]bool{}}
+	return &Manager{status: map[string]SourceStatus{}, history: map[string][]Result{}, running: map[string]bool{}}
 }
 
 func (m *Manager) Snapshot() map[string]SourceStatus {
@@ -97,6 +99,21 @@ func (m *Manager) Latest(sourceID string) []Result {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return append([]Result(nil), m.status[sourceID].Results...)
+}
+
+// History returns the full lightweight observation set for the most recent run.
+// It includes candidates eliminated before the speed final so the Furnace can
+// learn that a previously-good IP later became slow, lossy, or unreachable.
+func (m *Manager) History(sourceID string) []Result {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]Result(nil), m.history[sourceID]...)
+}
+
+func (m *Manager) IsRunning(sourceID string) bool {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
+	return m.running[sourceID]
 }
 
 func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
@@ -126,8 +143,8 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 		Observed: []Result{},
 		Logs:     []string{},
 	})
-	m.logf(s.ID, "STRICT START name=%q family=%s inputs=%d all_ip=%v colo=%s thresholds(latency<=%.0fms loss<=%.2f speed>=%.2fMB/s)",
-		s.Name, s.Family, len(s.Inputs), s.CFST.AllIP, strings.Join(s.CFST.Colo, ","),
+	m.logf(s.ID, "STRICT START name=%q family=%s inputs=%d sample=%d colo=%s thresholds(latency<=%.0fms loss<=%.2f speed>=%.2fMB/s)",
+		s.Name, s.Family, len(s.Inputs), s.SampleCount, strings.Join(s.CFST.Colo, ","),
 		s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB)
 
 	workdir, err := os.MkdirTemp("", "bestip-"+sanitize(s.ID)+"-")
@@ -136,14 +153,28 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	}
 	defer os.RemoveAll(workdir)
 
-	inputFile := filepath.Join(workdir, "ips.txt")
+	rawInputFile := filepath.Join(workdir, "ranges.txt")
 	m.patchStage(s.ID, "读取 IP 源")
-	inputItems, err := collectInputs(ctx, s, inputFile)
+	inputItems, err := collectInputs(ctx, s, rawInputFile)
 	if err != nil {
 		return m.fail(s.ID, err)
 	}
 	m.patchInputItems(s.ID, inputItems)
-	m.logf(s.ID, "INPUT ready items=%d file=%s", inputItems, inputFile)
+
+	// v0.6 owns candidate generation instead of delegating CIDR expansion to CFST.
+	// This makes IPv4 and IPv6 sampling predictable and allows an exact scan count.
+	inputFile := filepath.Join(workdir, "candidates.txt")
+	m.patchStage(s.ID, "生成候选 IP")
+	candidateCount, allocations, err := sampleCandidateFile(rawInputFile, inputFile, s.Family, s.SampleCount, s.GlobalMaxSample)
+	if err != nil {
+		return m.fail(s.ID, err)
+	}
+	m.patchCandidateCount(s.ID, candidateCount)
+	preHistory, err := readCandidateHistory(inputFile, s.Family)
+	if err == nil {
+		m.setHistory(s.ID, preHistory)
+	}
+	m.logf(s.ID, "INPUT ready ranges=%d candidates=%d allocation=%s", inputItems, candidateCount, strings.Join(allocations, " | "))
 
 	bin := s.CFST.Binary
 	if bin == "" {
@@ -160,6 +191,11 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	}
 	if _, statErr := os.Stat(probeFile); statErr != nil {
 		if os.IsNotExist(statErr) {
+			if s.Family == "ipv6" {
+				if hint := diagnoseIPv6Egress(ctx); hint != "" {
+					return m.fail(s.ID, fmt.Errorf("初筛完成，但没有任何可连通 IPv6；%s", hint))
+				}
+			}
 			return m.fail(s.ID, fmt.Errorf("初筛完成，但没有任何可连通 IP"))
 		}
 		return m.fail(s.ID, statErr)
@@ -170,18 +206,41 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	}
 
 	st := m.currentStatus(s.ID)
-	total := st.Progress.Total
+	total := st.CandidateCount
+	if total <= 0 {
+		total = st.Progress.Total
+	}
 	if total < len(probeRows) {
 		total = len(probeRows)
 	}
 	funnel := FunnelStats{TotalCandidates: total, Responsive: len(probeRows)}
 
+	now := time.Now()
+	historyRows := m.History(s.ID)
+	for i := range historyRows {
+		historyRows[i].TestedAt = now
+		historyRows[i].Qualified = false
+	}
+
 	latencyRows := make([]Result, 0, len(probeRows))
 	for _, r := range probeRows {
+		r.TestedAt = now
+		m.updateHistoryRowSlice(historyRows, r.IP, func(x *Result) {
+			x.LatencyMS = r.LatencyMS
+			x.Loss = r.Loss
+			x.TestedAt = now
+			x.RejectReason = "待延迟/丢包判定"
+		})
 		if s.CFST.LatencyMaxMS > 0 && r.LatencyMS > s.CFST.LatencyMaxMS {
+			m.updateHistoryRowSlice(historyRows, r.IP, func(x *Result) {
+				x.RejectReason = fmt.Sprintf("延迟 %.1fms > %.1fms", r.LatencyMS, s.CFST.LatencyMaxMS)
+			})
 			continue
 		}
 		if s.CFST.LatencyMinMS > 0 && r.LatencyMS < s.CFST.LatencyMinMS {
+			m.updateHistoryRowSlice(historyRows, r.IP, func(x *Result) {
+				x.RejectReason = fmt.Sprintf("延迟 %.1fms < %.1fms", r.LatencyMS, s.CFST.LatencyMinMS)
+			})
 			continue
 		}
 		latencyRows = append(latencyRows, r)
@@ -191,10 +250,15 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 	lossRows := make([]Result, 0, len(latencyRows))
 	for _, r := range latencyRows {
 		if s.CFST.LossMax >= 0 && r.Loss > s.CFST.LossMax {
+			m.updateHistoryRowSlice(historyRows, r.IP, func(x *Result) {
+				x.RejectReason = fmt.Sprintf("丢包 %.0f%% > %.0f%%", r.Loss*100, s.CFST.LossMax*100)
+			})
 			continue
 		}
 		lossRows = append(lossRows, r)
+		m.updateHistoryRowSlice(historyRows, r.IP, func(x *Result) { x.RejectReason = "待地区/速度决赛" })
 	}
+	m.setHistory(s.ID, historyRows)
 	funnel.LossPassed = len(lossRows)
 	m.patchFunnel(s.ID, funnel)
 	m.logf(s.ID, "FUNNEL initial total=%d responsive=%d latency_pass=%d loss_pass=%d",
@@ -257,6 +321,8 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 				m.logf(s.ID, "SPEED %d/%d ip=%s speed=%.2fMB/s QUALIFIED", i+1, len(finalists), finalists[i].IP, speed)
 			}
 		}
+
+		m.updateHistoryRow(s.ID, finalists[i])
 
 		funnel := m.currentStatus(s.ID).Funnel
 		funnel.SpeedTested = i + 1
@@ -404,11 +470,18 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 				r := job.row
 				colo, err := fetchColo(ctx, s, r.IP)
 				r.Colo = colo
+				if err != nil {
+					r.RejectReason = "地区探测失败：" + compactReason(err.Error())
+				} else if wanted[strings.ToUpper(strings.TrimSpace(colo))] {
+					r.RejectReason = "待速度决赛"
+				} else {
+					r.RejectReason = fmt.Sprintf("地区 %s 不匹配 %s", colo, strings.Join(s.CFST.Colo, ","))
+				}
+				m.updateHistoryRow(sourceID, r)
 
 				mu.Lock()
 				done++
 				if err == nil && wanted[strings.ToUpper(strings.TrimSpace(colo))] {
-					r.RejectReason = "待速度决赛"
 					passed = append(passed, r)
 				}
 				currentDone := done
@@ -453,10 +526,41 @@ func (m *Manager) filterByRegion(ctx context.Context, sourceID string, s config.
 	return passed
 }
 
+func effectiveProbeURL(s config.Source) string {
+	if v := strings.TrimSpace(s.CFST.ProbeURL); v != "" {
+		return normalizeHTTPURL(v, "https")
+	}
+	if v := strings.TrimSpace(s.GlobalProbeURL); v != "" {
+		return normalizeHTTPURL(v, "https")
+	}
+	return config.DefaultProbeURL
+}
+
+func effectiveSpeedURL(s config.Source) string {
+	if v := strings.TrimSpace(s.CFST.URL); v != "" {
+		return normalizeHTTPURL(v, "https")
+	}
+	if v := strings.TrimSpace(s.GlobalSpeedURL); v != "" {
+		return normalizeHTTPURL(v, "https")
+	}
+	return config.DefaultSpeedURL
+}
+
+func normalizeHTTPURL(v, scheme string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if !strings.HasPrefix(strings.ToLower(v), "http://") && !strings.HasPrefix(strings.ToLower(v), "https://") {
+		v = scheme + "://" + v
+	}
+	return v
+}
+
 func fetchColo(ctx context.Context, s config.Source, ip string) (string, error) {
-	raw := strings.TrimSpace(s.CFST.URL)
+	raw := effectiveProbeURL(s)
 	if raw == "" {
-		raw = "https://speed.cloudflare.com/__down?bytes=1000000"
+		raw = config.DefaultProbeURL
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" {
@@ -481,7 +585,7 @@ func fetchColo(ctx context.Context, s config.Source, ip string) (string, error) 
 		}
 	}
 
-	traceURL := fmt.Sprintf("%s://%s/cdn-cgi/trace", scheme, u.Host)
+	traceURL := u.String()
 	client := boundHTTPClient(ip, port, host, 2500*time.Millisecond)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, traceURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
@@ -519,9 +623,9 @@ func fetchColo(ctx context.Context, s config.Source, ip string) (string, error) 
 }
 
 func measureDownloadSpeed(ctx context.Context, s config.Source, ip string) (float64, error) {
-	raw := strings.TrimSpace(s.CFST.URL)
+	raw := effectiveSpeedURL(s)
 	if raw == "" {
-		raw = "https://speed.cloudflare.com/__down?bytes=100000000"
+		raw = config.DefaultSpeedURL
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" {
@@ -740,6 +844,48 @@ func (m *Manager) patchInputItems(id string, n int) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) patchCandidateCount(id string, n int) {
+	m.mu.Lock()
+	st := m.status[id]
+	st.CandidateCount = n
+	st.LastUpdate = time.Now()
+	m.status[id] = st
+	m.mu.Unlock()
+}
+
+func (m *Manager) setHistory(id string, rows []Result) {
+	m.mu.Lock()
+	m.history[id] = append([]Result(nil), rows...)
+	m.mu.Unlock()
+}
+
+func (m *Manager) updateHistoryRow(id string, row Result) {
+	m.mu.Lock()
+	rows := m.history[id]
+	for i := range rows {
+		if rows[i].IP == row.IP {
+			if row.TestedAt.IsZero() {
+				row.TestedAt = rows[i].TestedAt
+			}
+			rows[i] = row
+			m.history[id] = rows
+			m.mu.Unlock()
+			return
+		}
+	}
+	m.history[id] = append(rows, row)
+	m.mu.Unlock()
+}
+
+func (m *Manager) updateHistoryRowSlice(rows []Result, ip string, fn func(*Result)) {
+	for i := range rows {
+		if rows[i].IP == ip {
+			fn(&rows[i])
+			return
+		}
+	}
+}
+
 func (m *Manager) patchProgress(id string, p ScanProgress) {
 	if p.Total > 0 {
 		p.Percent = p.Current * 100 / p.Total
@@ -944,22 +1090,19 @@ func buildProbeArgs(s config.Source, inputFile, outFile string) []string {
 	c := s.CFST
 	args := []string{"-f", inputFile, "-o", outFile, "-dd", "-p", "0"}
 	if c.Threads > 0 {
-		args = append(args, "-t", strconv.Itoa(c.Threads))
+		args = append(args, "-n", strconv.Itoa(c.Threads))
 	}
 	if c.PingCount > 0 {
-		args = append(args, "-n", strconv.Itoa(c.PingCount))
+		args = append(args, "-t", strconv.Itoa(c.PingCount))
 	}
 	if c.Port > 0 {
 		args = append(args, "-tp", strconv.Itoa(c.Port))
 	}
-	if c.URL != "" && c.HTTPing && len(c.Colo) == 0 {
-		args = append(args, "-url", c.URL)
-	}
 	if c.HTTPing && len(c.Colo) == 0 {
+		if u := effectiveProbeURL(s); u != "" {
+			args = append(args, "-url", u)
+		}
 		args = append(args, "-httping")
-	}
-	if c.AllIP {
-		args = append(args, "-allip")
 	}
 	// Deliberately omit -tl/-tll/-tlr/-sl/-cfcolo so the pre-scan preserves
 	// responsive IPs that later fail user thresholds.
@@ -970,10 +1113,10 @@ func buildArgs(s config.Source, inputFile, outFile string) []string {
 	c := s.CFST
 	args := []string{"-f", inputFile, "-o", outFile}
 	if c.Threads > 0 {
-		args = append(args, "-t", strconv.Itoa(c.Threads))
+		args = append(args, "-n", strconv.Itoa(c.Threads))
 	}
 	if c.PingCount > 0 {
-		args = append(args, "-n", strconv.Itoa(c.PingCount))
+		args = append(args, "-t", strconv.Itoa(c.PingCount))
 	}
 	downloadCount := c.DownloadCount
 	if downloadCount <= 0 {
@@ -1009,8 +1152,8 @@ func buildArgs(s config.Source, inputFile, outFile string) []string {
 	if c.SpeedMinMB > 0 {
 		args = append(args, "-sl", fmt.Sprintf("%.2f", c.SpeedMinMB))
 	}
-	if c.URL != "" {
-		args = append(args, "-url", c.URL)
+	if u := effectiveSpeedURL(s); u != "" {
+		args = append(args, "-url", u)
 	}
 	// With a region filter, use TCPing + download and filter the CSV's actual
 	// Colo afterwards. This avoids losing candidates during HTTP HEAD pre-filtering.
@@ -1019,9 +1162,6 @@ func buildArgs(s config.Source, inputFile, outFile string) []string {
 	}
 	// We consume result.csv ourselves; suppress the verbose terminal result table.
 	args = append(args, "-p", "0")
-	if c.AllIP {
-		args = append(args, "-allip")
-	}
 	return args
 }
 
@@ -1103,6 +1243,46 @@ func validForFamily(v, family string) bool {
 		return ip.To4() != nil
 	}
 	return ip.To4() == nil
+}
+
+// diagnoseIPv6Egress distinguishes "the sampled prefix has no usable IP" from
+// "this Docker network namespace has no IPv6 route". It is only used after an
+// IPv6 probe returned zero rows, so it adds virtually no overhead to healthy runs.
+func diagnoseIPv6Egress(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	// Cloudflare public DNS is used only as a routing sanity check; no payload is
+	// sent and it is not used for latency/speed ranking.
+	d := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", "[2606:4700:4700::1111]:443")
+	if err == nil {
+		_ = conn.Close()
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "network is unreachable") || strings.Contains(msg, "no route to host") || strings.Contains(msg, "cannot assign requested address") {
+		return "容器没有可用 IPv6 出站路由（Docker bridge 常见）；请在飞牛启用 Docker IPv6，或换用包内的 host 网络 Compose"
+	}
+	return "IPv6 出站自检也失败：" + compactReason(err.Error())
+}
+
+func readCandidateHistory(path, family string) ([]Result, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	now := time.Now()
+	rows := []Result{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		ip := strings.TrimSpace(sc.Text())
+		if net.ParseIP(ip) == nil {
+			continue
+		}
+		rows = append(rows, Result{IP: ip, Family: family, Loss: 1, TestedAt: now, RejectReason: "未通过连通性初筛"})
+	}
+	return rows, sc.Err()
 }
 
 func writeResultIPs(path string, rows []Result) error {

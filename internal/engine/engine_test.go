@@ -15,11 +15,11 @@ import (
 	"github.com/honghanh691913-glitch/Cloudflare-BestIP/internal/config"
 )
 
-func TestBuildProbeArgsIsLightweightAndAllIP(t *testing.T) {
+func TestBuildProbeArgsIsLightweightAndExactCandidates(t *testing.T) {
 	s := config.Source{
 		Family: "ipv4",
 		CFST: config.CFST{
-			Threads: 4, PingCount: 200, Port: 443,
+			Threads: 200, PingCount: 4, Port: 443,
 			LatencyMaxMS: 100, LossMax: 0.1, SpeedMinMB: 40,
 			HTTPing: true, Colo: []string{"NRT"}, AllIP: true,
 		},
@@ -30,8 +30,11 @@ func TestBuildProbeArgsIsLightweightAndAllIP(t *testing.T) {
 			t.Fatalf("light probe must not pre-filter; found %q in %s", forbidden, joined)
 		}
 	}
-	if !strings.Contains(joined, "-dd") || !strings.Contains(joined, "-allip") {
+	if !strings.Contains(joined, "-dd") {
 		t.Fatalf("probe flags missing: %s", joined)
+	}
+	if strings.Contains(joined, "-allip") {
+		t.Fatalf("v0.6 must pass exact sampled IPs, not CFST -allip: %s", joined)
 	}
 }
 
@@ -69,6 +72,7 @@ func TestFetchColoAndMeasureSpeedAgainstBoundIP(t *testing.T) {
 
 	s := config.Source{CFST: config.CFST{
 		URL:          "http://example.test/download",
+		ProbeURL:     "http://example.test/cdn-cgi/trace",
 		Port:         port,
 		DownloadTime: 1,
 	}}

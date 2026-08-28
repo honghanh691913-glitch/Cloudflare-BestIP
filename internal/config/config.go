@@ -4,19 +4,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 )
 
+const (
+	DefaultProbeURL       = "https://speed.cloudflare.com/cdn-cgi/trace"
+	DefaultSpeedURL       = "https://cf.090227.xyz/__down?bytes=99999999"
+	DefaultMaxSampleCount = 10000
+)
+
 type Config struct {
-	Version        int        `json:"version"`
-	Listen         string     `json:"listen"`
-	MaxConcurrency int        `json:"max_concurrency"`
-	Providers      []Provider `json:"providers"`
-	Sources        []Source   `json:"sources"`
-	Targets        []Target   `json:"targets"`
+	Version              int           `json:"version"`
+	Listen               string        `json:"listen"`
+	MaxConcurrency       int           `json:"max_concurrency"`
+	ProbeURL             string        `json:"probe_url,omitempty"`
+	SpeedURL             string        `json:"speed_url,omitempty"`
+	HealthCheckMinutes   int           `json:"health_check_minutes,omitempty"`
+	MaxSampleCount       int           `json:"max_sample_count,omitempty"`
+	FurnaceRetentionDays int           `json:"furnace_retention_days,omitempty"`
+	FurnaceAutoRank      bool          `json:"furnace_auto_rank"`
+	Providers            []Provider    `json:"providers"`
+	Sources              []Source      `json:"sources"`
+	Targets              []Target      `json:"targets"`
+	FurnaceRules         []FurnaceRule `json:"furnace_rules,omitempty"`
 }
 
 type Provider struct {
@@ -43,12 +57,19 @@ type Source struct {
 	Inputs          []string `json:"inputs"` // URL / file / CIDR / IP
 	IntervalMinutes int      `json:"interval_minutes"`
 	KeepResults     int      `json:"keep_results"`
+	SampleCount     int      `json:"sample_count,omitempty"` // total candidates per run, distributed across ranges
 	CFST            CFST     `json:"cfst"`
+
+	// Runtime-only global fallbacks populated by PrepareSource.
+	GlobalProbeURL  string `json:"-"`
+	GlobalSpeedURL  string `json:"-"`
+	GlobalMaxSample int    `json:"-"`
 }
 
 type CFST struct {
 	Binary        string   `json:"binary"`
-	URL           string   `json:"url"`
+	URL           string   `json:"url,omitempty"`       // optional per-line speed URL override
+	ProbeURL      string   `json:"probe_url,omitempty"` // optional per-line trace/probe URL override
 	Port          int      `json:"port"`
 	Threads       int      `json:"threads"`
 	PingCount     int      `json:"ping_count"`
@@ -60,7 +81,7 @@ type CFST struct {
 	SpeedMinMB    float64  `json:"speed_min_mb"`
 	HTTPing       bool     `json:"httping"`
 	Colo          []string `json:"colo"`
-	AllIP         bool     `json:"all_ip"`
+	AllIP         bool     `json:"all_ip,omitempty"` // legacy only; v0.6 uses SampleCount
 }
 
 type Target struct {
@@ -80,6 +101,15 @@ type TargetRef struct {
 	Count    int    `json:"count"`
 }
 
+type FurnaceRule struct {
+	SourceID     string  `json:"source_id"`
+	Enabled      bool    `json:"enabled"`
+	LatencyMaxMS float64 `json:"latency_max_ms"`
+	LossMax      float64 `json:"loss_max"`
+	SpeedMinMB   float64 `json:"speed_min_mb"`
+	AutoRank     bool    `json:"auto_rank"`
+}
+
 type Store struct {
 	path string
 	mu   sync.RWMutex
@@ -94,6 +124,122 @@ func NewStore(path string) (*Store, error) {
 	return s, nil
 }
 
+func ApplyDefaults(c *Config) {
+	if c == nil {
+		return
+	}
+	legacy := c.Version < 2
+	if strings.TrimSpace(c.Listen) == "" {
+		c.Listen = ":8080"
+	}
+	if c.MaxConcurrency < 1 {
+		c.MaxConcurrency = 2
+	}
+	if strings.TrimSpace(c.ProbeURL) == "" {
+		c.ProbeURL = DefaultProbeURL
+	}
+	if strings.TrimSpace(c.SpeedURL) == "" {
+		c.SpeedURL = DefaultSpeedURL
+	}
+	if c.HealthCheckMinutes < 0 {
+		c.HealthCheckMinutes = 0
+	}
+	if legacy && c.HealthCheckMinutes == 0 {
+		c.HealthCheckMinutes = 60
+	}
+	if c.MaxSampleCount <= 0 {
+		c.MaxSampleCount = DefaultMaxSampleCount
+	}
+	if c.MaxSampleCount > 100000 {
+		c.MaxSampleCount = 100000
+	}
+	if c.FurnaceRetentionDays <= 0 {
+		c.FurnaceRetentionDays = 45
+	}
+	if legacy {
+		c.FurnaceAutoRank = true
+	}
+	for i := range c.Sources {
+		s := &c.Sources[i]
+		if s.KeepResults <= 0 {
+			s.KeepResults = 50
+		}
+		if s.SampleCount <= 0 {
+			if s.CFST.AllIP && s.Family == "ipv4" {
+				// Legacy All IP migration: for literal IPv4 CIDRs, preserve the
+				// intuitive real count (/24 -> 256, two /24 -> 512). Remote lists
+				// stay bounded by the global maximum and are clamped at runtime.
+				s.SampleCount = legacyIPv4Capacity(s.Inputs, c.MaxSampleCount)
+			} else {
+				s.SampleCount = 256
+			}
+		}
+		if s.SampleCount > c.MaxSampleCount {
+			s.SampleCount = c.MaxSampleCount
+		}
+		s.CFST.AllIP = false
+		if s.CFST.Port <= 0 {
+			s.CFST.Port = 443
+		}
+		// Pre-v0.6 configs stored these two semantic names reversed while the
+		// engine also emitted the reversed flags, so runtime behavior was still
+		// usually -n 200 / -t 4. Migrate the common legacy shape once here.
+		if legacy && s.CFST.Threads > 0 && s.CFST.Threads <= 16 && s.CFST.PingCount >= 32 {
+			s.CFST.Threads, s.CFST.PingCount = s.CFST.PingCount, s.CFST.Threads
+		}
+		if s.CFST.Threads <= 0 {
+			s.CFST.Threads = 200
+		}
+		if s.CFST.PingCount <= 0 {
+			s.CFST.PingCount = 4
+		}
+		if s.CFST.DownloadTime <= 0 {
+			s.CFST.DownloadTime = 10
+		}
+	}
+	c.Version = 2
+}
+
+func legacyIPv4Capacity(inputs []string, max int) int {
+	if max <= 0 {
+		max = DefaultMaxSampleCount
+	}
+	total := uint64(0)
+	for _, raw := range inputs {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+			return max
+		}
+		if !strings.Contains(v, "/") {
+			if net.ParseIP(v) == nil || net.ParseIP(v).To4() == nil {
+				return max
+			}
+			total++
+			continue
+		}
+		ip, n, err := net.ParseCIDR(v)
+		if err != nil || ip.To4() == nil {
+			return max
+		}
+		ones, bits := n.Mask.Size()
+		if bits != 32 || ones < 0 {
+			return max
+		}
+		cap := uint64(1) << uint(32-ones)
+		total += cap
+		if total >= uint64(max) {
+			return max
+		}
+	}
+	if total == 0 {
+		return 256
+	}
+	return int(total)
+}
+
 func (s *Store) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,6 +251,7 @@ func (s *Store) Load() error {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return err
 	}
+	ApplyDefaults(&c)
 	if err := Validate(c); err != nil {
 		return err
 	}
@@ -118,10 +265,12 @@ func (s *Store) Get() Config {
 	b, _ := json.Marshal(s.cfg)
 	var out Config
 	_ = json.Unmarshal(b, &out)
+	ApplyDefaults(&out)
 	return out
 }
 
 func (s *Store) Save(c Config) error {
+	ApplyDefaults(&c)
 	if err := Validate(c); err != nil {
 		return err
 	}
@@ -173,8 +322,6 @@ func TargetHostname(p Provider, t Target) string {
 	if domain != "" && strings.TrimSpace(t.Prefix) == "@" {
 		return domain
 	}
-
-	// Old configs stored the full hostname directly.
 	return normalizeDomain(t.Hostname)
 }
 
@@ -192,9 +339,35 @@ func CloudflareAuthMode(p Provider) string {
 	return "api_token"
 }
 
+func PrepareSource(c Config, s Source) Source {
+	ApplyDefaults(&c)
+	s.GlobalProbeURL = c.ProbeURL
+	s.GlobalSpeedURL = c.SpeedURL
+	s.GlobalMaxSample = c.MaxSampleCount
+	if s.SampleCount <= 0 {
+		s.SampleCount = 256
+	}
+	if s.GlobalMaxSample > 0 && s.SampleCount > s.GlobalMaxSample {
+		s.SampleCount = s.GlobalMaxSample
+	}
+	return s
+}
+
+func FurnaceRuleFor(c Config, sourceID string) (FurnaceRule, bool) {
+	for _, r := range c.FurnaceRules {
+		if r.SourceID == sourceID {
+			return r, true
+		}
+	}
+	return FurnaceRule{}, false
+}
+
 func Validate(c Config) error {
 	if c.Listen == "" {
 		return errors.New("listen cannot be empty")
+	}
+	if c.MaxSampleCount < 1 || c.MaxSampleCount > 100000 {
+		return fmt.Errorf("max_sample_count must be between 1 and 100000")
 	}
 	sourceIDs := map[string]bool{}
 	for _, s := range c.Sources {
@@ -207,6 +380,9 @@ func Validate(c Config) error {
 		sourceIDs[s.ID] = true
 		if s.Family != "ipv4" && s.Family != "ipv6" {
 			return fmt.Errorf("source %s: family must be ipv4 or ipv6", s.ID)
+		}
+		if s.SampleCount < 1 {
+			return fmt.Errorf("source %s: sample_count must be >= 1", s.ID)
 		}
 	}
 	providerIDs := map[string]bool{}
@@ -259,6 +435,19 @@ func Validate(c Config) error {
 			if r.Count < 1 {
 				return fmt.Errorf("target %s source %s count must be >= 1", t.ID, r.SourceID)
 			}
+		}
+	}
+	seenRules := map[string]bool{}
+	for _, r := range c.FurnaceRules {
+		if r.SourceID == "" || !sourceIDs[r.SourceID] {
+			return fmt.Errorf("furnace rule references missing source %s", r.SourceID)
+		}
+		if seenRules[r.SourceID] {
+			return fmt.Errorf("duplicate furnace rule for source %s", r.SourceID)
+		}
+		seenRules[r.SourceID] = true
+		if r.LatencyMaxMS < 0 || r.LossMax < 0 || r.LossMax > 1 || r.SpeedMinMB < 0 {
+			return fmt.Errorf("invalid furnace thresholds for source %s", r.SourceID)
 		}
 	}
 	return nil
