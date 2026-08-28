@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -82,10 +83,57 @@ type Manager struct {
 	history map[string][]Result
 	runMu   sync.Mutex
 	running map[string]bool
+	cancels map[string]context.CancelFunc
 }
 
 func NewManager() *Manager {
-	return &Manager{status: map[string]SourceStatus{}, history: map[string][]Result{}, running: map[string]bool{}}
+	return &Manager{
+		status: map[string]SourceStatus{},
+		history: map[string][]Result{},
+		running: map[string]bool{},
+		cancels: map[string]context.CancelFunc{},
+	}
+}
+
+func (m *Manager) beginRun(parent context.Context, sourceID string) (context.Context, bool) {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
+	if m.running[sourceID] {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.running[sourceID] = true
+	m.cancels[sourceID] = cancel
+	return ctx, true
+}
+
+func (m *Manager) endRun(sourceID string) {
+	m.runMu.Lock()
+	if cancel := m.cancels[sourceID]; cancel != nil {
+		cancel()
+	}
+	delete(m.cancels, sourceID)
+	delete(m.running, sourceID)
+	m.runMu.Unlock()
+}
+
+func (m *Manager) StopSource(sourceID string) bool {
+	m.runMu.Lock()
+	cancel := m.cancels[sourceID]
+	running := m.running[sourceID]
+	m.runMu.Unlock()
+	if !running || cancel == nil {
+		return false
+	}
+	m.mu.Lock()
+	st := m.status[sourceID]
+	st.Stage = "正在停止"
+	st.LastUpdate = time.Now()
+	m.status[sourceID] = st
+	m.mu.Unlock()
+	m.logf(sourceID, "STOP requested by user")
+	cancel()
+	return true
 }
 
 func (m *Manager) Snapshot() map[string]SourceStatus {
@@ -120,18 +168,12 @@ func (m *Manager) IsRunning(sourceID string) bool {
 }
 
 func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
-	m.runMu.Lock()
-	if m.running[s.ID] {
-		m.runMu.Unlock()
+	var ok bool
+	ctx, ok = m.beginRun(ctx, s.ID)
+	if !ok {
 		return fmt.Errorf("source %s already running", s.ID)
 	}
-	m.running[s.ID] = true
-	m.runMu.Unlock()
-	defer func() {
-		m.runMu.Lock()
-		delete(m.running, s.ID)
-		m.runMu.Unlock()
-	}()
+	defer m.endRun(s.ID)
 
 	prev := m.currentStatus(s.ID)
 	started := time.Now()
@@ -1041,6 +1083,19 @@ func (m *Manager) logf(id, format string, args ...any) {
 }
 
 func (m *Manager) fail(id string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		m.mu.Lock()
+		st := m.status[id]
+		st.Running = false
+		st.Stage = "已停止"
+		st.Error = ""
+		st.EndedAt = time.Now()
+		st.LastUpdate = time.Now()
+		m.status[id] = st
+		m.mu.Unlock()
+		m.logf(id, "STOPPED")
+		return err
+	}
 	m.mu.Lock()
 	st := m.status[id]
 	st.Running = false

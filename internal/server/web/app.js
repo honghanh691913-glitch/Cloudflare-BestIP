@@ -158,9 +158,11 @@ function renderTasks(){
       return `<div class="line-row" data-source="${esc(s.id)}"><span class="line-family">${recordType(s.family)}</span><span class="line-meta">${esc(s.name||lineTitle(s))} · ${esc(meta)}${st.running?`<div class="mini-progress"><i style="width:${Math.min(100,pct)}%"></i></div>`:''}</span><span class="line-result">${st.running?`${esc(sourceRunLabel(s.id)||st.stage||'扫描')} ${pct}%${eta}`:`${st.results?.length||0} 条`}</span></div>`;
     }).join('');
     const wrap=document.createElement('div');wrap.className='task-unit';
-    wrap.innerHTML=`<div class="task-unit-bar"><button class="task-power ${t.enabled?'on':'off'}" data-toggle>${t.enabled?'● 已开启':'○ 已关闭'}</button><span class="next-run">${t.enabled?`下次：${nextRunForTask(t)}`:'不会自动扫描'}</span></div><article class="task-card ${state.cls}"><div class="task-top"><div><div class="task-domain">${esc(taskHostname(t))}</div>${t.name?`<div class="task-name">${esc(t.name)}</div>`:''}</div><div class="status-dot ${state.badge}">${state.text}</div></div><div class="chips">${chips.join('')}</div><div class="line-preview">${rows||'<div class="line-row"><span class="line-meta">尚未配置线路</span></div>'}</div>${err?`<div class="task-error">${esc(err)}</div>`:''}<div class="card-actions"><button class="run" data-run>立即严选</button><button class="sync" data-sync>同步 DNS</button><button class="more" data-edit>•••</button></div></article>`;
+    const busy=taskRunning(t);
+    const runButton=busy?`<button class="run run-busy" data-run><span class="run-normal">严选中…</span><span class="run-stop">停止严选</span></button>`:`<button class="run" data-run>立即严选</button>`;
+    wrap.innerHTML=`<div class="task-unit-bar"><button class="task-power ${t.enabled?'on':'off'}" data-toggle>${t.enabled?'● 已开启':'○ 已关闭'}</button><span class="next-run">${t.enabled?`下次：${nextRunForTask(t)}`:'不会自动扫描'}</span></div><article class="task-card ${state.cls}"><div class="task-top"><div><div class="task-domain">${esc(taskHostname(t))}</div>${t.name?`<div class="task-name">${esc(t.name)}</div>`:''}</div><div class="status-dot ${state.badge}">${state.text}</div></div><div class="chips">${chips.join('')}</div><div class="line-preview">${rows||'<div class="line-row"><span class="line-meta">尚未配置线路</span></div>'}</div>${err?`<div class="task-error">${esc(err)}</div>`:''}<div class="card-actions">${runButton}<button class="sync" data-sync>同步 DNS</button><button class="more" data-edit>•••</button></div></article>`;
     wrap.querySelector('[data-toggle]').onclick=()=>toggleTask(t.id);
-    wrap.querySelector('[data-run]').onclick=()=>runTask(t);
+    wrap.querySelector('[data-run]').onclick=()=>busy?stopTask(t):runTask(t);
     wrap.querySelector('[data-sync]').onclick=()=>syncTask(t);
     wrap.querySelector('[data-edit]').onclick=()=>openTaskEditor(t.id);
     wrap.querySelectorAll('[data-source]').forEach(el=>el.onclick=()=>openScanDetail(el.dataset.source));
@@ -170,6 +172,15 @@ function renderTasks(){
 async function toggleTask(id){const t=cfg.targets.find(x=>x.id===id);if(!t)return;t.enabled=!t.enabled;recomputeSourceEnabled();await saveConfig(t.enabled?'任务已开启':'任务已关闭')}
 function recomputeSourceEnabled(){for(const s of cfg.sources)s.enabled=cfg.targets.some(t=>t.enabled&&(t.sources||[]).some(r=>r.source_id===s.id))}
 async function runTask(t){if(!t.enabled)return toast('先开启这个任务',true);const lines=taskLines(t);if(!lines.length)return toast('没有 IP 线路',true);try{for(const x of lines)await api('/api/run/source?id='+encodeURIComponent(x.source.id),{method:'POST'});toast(`已启动 ${lines.length} 条严选线路`);setTimeout(()=>refreshStatus(true),400)}catch(e){toast(e.message,true)}}
+async function stopTask(t){
+  const running=taskLines(t).filter(x=>runtime.sources?.[x.source.id]?.running);
+  if(!running.length)return toast('任务已经停止');
+  try{
+    await Promise.all(running.map(x=>api('/api/stop/source?id='+encodeURIComponent(x.source.id),{method:'POST'})));
+    toast(`正在停止 ${running.length} 条任务`);
+    setTimeout(()=>refreshStatus(true),250);
+  }catch(e){toast(`停止失败：${e.message}`,true)}
+}
 async function syncTask(t){try{await api('/api/sync/target?id='+encodeURIComponent(t.id),{method:'POST'});toast('DNS 同步成功');refreshStatus(true)}catch(e){toast(`同步失败：${e.message}`,true)}}
 
 function openScanDetail(sourceId){scanDetailSourceId=sourceId;drawScanDetail()}
@@ -177,7 +188,7 @@ function drawScanDetail(){
   if(!scanDetailSourceId)return;
   const s=sourceById(scanDetailSourceId),st=runtime.sources?.[scanDetailSourceId]||{},hs=runtime.health?.[scanDetailSourceId]||{};if(!s)return;
   const p=st.progress||{},f=st.funnel||{},obs=st.observed||[],required=sourceRequiredCount(s.id);
-  const active=(st.results||[]).slice(0,required);
+  const active=((runtime.active_dns?.[scanDetailSourceId]||[]).length?runtime.active_dns[scanDetailSourceId]:(st.results||[])).slice(0,required);
   const freshRows=(hs.rows||[]).length?hs.rows:((p.phase==='health')?obs:[]),freshMap=new Map(freshRows.map(r=>[r.ip,r]));
   const activeRows=active.map((old,i)=>{const r=freshMap.get(old.ip)||old;const checking=st.running&&p.phase==='health'&&!freshMap.has(old.ip);const cls=checking?'wait':(freshMap.has(old.ip)?(r.qualified?'good':'bad'):'active');const state=checking?'等待检测':(freshMap.has(old.ip)?(r.qualified?'健康':'需替换'):'当前在用');return `<div class="active-ip-row ${cls}"><div><b>${esc(r.ip)}</b><span>${esc(r.colo||(!s.cfst?.colo?.length?'不限地区':'未识别'))}</span></div><div><span>${Number(r.latency_ms)>0?fmtNum(r.latency_ms,0)+'ms':'—'}</span><span>${r.speed_tested?fmtNum(r.speed_mb,1)+'MB/s':'—'}</span><span class="active-state">${esc(state)}</span></div></div>`}).join('');
 
@@ -200,7 +211,7 @@ function drawScanDetail(){
   const logs=(st.logs||[]).join('\n');
 
   $('#modalRoot').innerHTML=`<div class="overlay" id="scanOverlay"><div class="sheet"><div class="sheet-head"><h3>${esc(s.name||lineTitle(s))}</h3><button class="sheet-close" data-close>×</button></div><div class="sheet-body" data-ui-key="scan-sheet-body">
-    <section class="active-ip-card" data-ui-key="active-ip-card"><div class="active-ip-head"><div><b>当前域名正在使用的 IP</b><span>${active.length}/${required} · 严选期间保持不变</span></div><span class="chip ${hs.ok?'health-good':hs.running?'health-warn':''}">${hs.running?(hs.phase==='refill'?'自动补位中':'健康检测中'):(hs.ok?'健康正常':'当前在用')}</span></div>${activeRows||'<div class="empty compact-empty">尚未恢复当前 DNS IP 数据</div>'}</section>
+    <section class="active-ip-card" data-ui-key="active-ip-card"><div class="active-ip-head"><div><b>当前域名正在使用的 IP</b><span>${active.length}/${required} · 严选期间保持不变</span></div><span class="chip ${hs.ok?'health-good':hs.running?'health-warn':''}">${hs.running?(hs.phase==='refill'?'自动补位中':'健康检测中'):(hs.ok?'健康正常':'当前在用')}</span></div>${activeRows||'<div class="empty compact-empty">正在读取 Cloudflare 当前 DNS IP；读取失败时不会因此自动覆盖 DNS</div>'}</section>
     <div class="scan-head"><div><div class="scan-stage">${esc(isHealth?(hs.phase==='refill'?'自动补位':(st.stage||'健康检查')):(st.stage||'等待运行'))}</div><div class="help">候选 ${st.candidate_count||s.sample_count||0} · ${fmtFamily(s.family)} ${(s.cfst?.colo||[]).join('/')||'不限地区'}</div></div><button id="healthNowBtn" class="ghost compact" ${st.running?'disabled':''}>健康检查</button></div>
     ${isHealth?`<div class="health-progress-card"><div class="health-progress-head"><b>${esc(healthText||'健康检查')}</b><span>${healthPct}%</span></div><div class="progress-bar"><i style="width:${healthPct}%"></i></div><div class="help">${phase==='health'?`${eta}${elapsed?' · '+elapsed:''}`:(hs.phase==='refill'?'健康 IP 保留不动，只补缺失位置':'')}</div></div>`:`<div class="flow-steps">${flowSteps}</div><div class="progress-bar"><i style="width:${Math.min(100,Number(p.percent||0))}%"></i></div><div class="progress-meta"><span>${p.current||0}/${p.total||0} · ${Math.min(100,Number(p.percent||0))}%</span><span>${esc(eta)}${elapsed?' · '+esc(elapsed):''}</span></div>`}
     <div class="scan-stats"><div class="metric"><b>${f.total_candidates||st.candidate_count||0}</b><span>候选</span></div><div class="metric"><b>${f.loss_passed||0}</b><span>初筛</span></div><div class="metric"><b>${tested}</b><span>决赛已测</span></div><div class="metric"><b>${good}</b><span>速度合格</span></div></div>

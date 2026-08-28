@@ -13,9 +13,10 @@ import (
 )
 
 type HealthReport struct {
-	Checked int      `json:"checked"`
-	Healthy int      `json:"healthy"`
-	Rows    []Result `json:"rows"`
+	Checked  int      `json:"checked"`
+	Healthy  int      `json:"healthy"`
+	Rows     []Result `json:"rows"`
+	Canceled bool     `json:"canceled,omitempty"`
 }
 
 // CheckHealth revalidates current DNS candidates using the same three hard
@@ -23,18 +24,12 @@ type HealthReport struct {
 // requested Colo, and minimum download speed. It intentionally checks only the
 // small active set supplied by the caller rather than rescanning the whole CIDR.
 func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Result) HealthReport {
-	m.runMu.Lock()
-	if m.running[s.ID] {
-		m.runMu.Unlock()
+	var ok bool
+	ctx, ok = m.beginRun(ctx, s.ID)
+	if !ok {
 		return HealthReport{}
 	}
-	m.running[s.ID] = true
-	m.runMu.Unlock()
-	defer func() {
-		m.runMu.Lock()
-		delete(m.running, s.ID)
-		m.runMu.Unlock()
-	}()
+	defer m.endRun(s.ID)
 
 	prev := m.currentStatus(s.ID)
 	started := time.Now()
@@ -51,52 +46,26 @@ func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Re
 		if err := ctx.Err(); err != nil {
 			break
 		}
-		r := old
-		r.TestedAt = time.Now()
-		r.Qualified = false
-		r.SpeedTested = false
-		r.RejectReason = ""
-
-		latency, loss := measureLatencyLoss(ctx, r.IP, s.CFST.Port, maxInt(s.CFST.PingCount, 4))
-		r.LatencyMS = latency
-		r.Loss = loss
+		r := checkHealthOnce(ctx, s, old)
+		// A current production IP is not evicted on one transient sample.
+		// Only a second consecutive failure in the same health cycle confirms replacement.
+		if !r.Qualified && ctx.Err() == nil {
+			m.logf(s.ID, "HEALTH RETRY ip=%s first_failure=%s", r.IP, r.RejectReason)
+			select {
+			case <-ctx.Done():
+			case <-time.After(1500 * time.Millisecond):
+				r2 := checkHealthOnce(ctx, s, old)
+				if r2.Qualified {
+					m.logf(s.ID, "HEALTH RECOVERED ip=%s second_check_passed", r2.IP)
+					r = r2
+				} else if ctx.Err() == nil {
+					r = r2
+					r.RejectReason = "连续两次不达标：" + r2.RejectReason
+				}
+			}
+		}
 		report.Checked++
-		if loss >= 1 {
-			r.RejectReason = "健康检查：无法连接"
-		} else if s.CFST.LatencyMaxMS > 0 && latency > s.CFST.LatencyMaxMS {
-			r.RejectReason = fmt.Sprintf("健康检查：延迟 %.1fms > %.1fms", latency, s.CFST.LatencyMaxMS)
-		} else if s.CFST.LossMax >= 0 && loss > s.CFST.LossMax {
-			r.RejectReason = fmt.Sprintf("健康检查：丢包 %.0f%% > %.0f%%", loss*100, s.CFST.LossMax*100)
-		} else if len(s.CFST.Colo) > 0 {
-			colo, err := fetchColo(ctx, s, r.IP)
-			if err != nil {
-				r.RejectReason = "健康检查：地区探测失败"
-			} else {
-				r.Colo = colo
-				if !containsColo(s.CFST.Colo, colo) {
-					r.RejectReason = fmt.Sprintf("健康检查：地区 %s 不匹配 %s", colo, strings.Join(s.CFST.Colo, ","))
-				}
-			}
-		} else if strings.TrimSpace(r.Colo) == "" {
-			// No region restriction: resolve Colo only for display. Failure is not fatal.
-			if colo, err := fetchColo(ctx, s, r.IP); err == nil {
-				r.Colo = colo
-			}
-		}
-		if r.RejectReason == "" {
-			speed, err := measureDownloadSpeed(ctx, s, r.IP)
-			r.SpeedTested = true
-			if err != nil {
-				r.RejectReason = "健康检查：测速失败"
-			} else {
-				r.SpeedMB = speed
-				if s.CFST.SpeedMinMB > 0 && speed < s.CFST.SpeedMinMB {
-					r.RejectReason = fmt.Sprintf("健康检查：速度 %.2fMB/s < %.2fMB/s", speed, s.CFST.SpeedMinMB)
-				}
-			}
-		}
-		if r.RejectReason == "" {
-			r.Qualified = true
+		if r.Qualified {
 			report.Healthy++
 		}
 		report.Rows = append(report.Rows, r)
@@ -104,6 +73,21 @@ func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Re
 		m.patchProgress(s.ID, ScanProgress{Phase: "health", Current: i + 1, Total: len(current), Available: report.Healthy})
 		m.logf(s.ID, "HEALTH %d/%d ip=%s healthy=%v colo=%s latency=%.1fms loss=%.0f%% speed=%.2fMB/s reason=%s",
 			i+1, len(current), r.IP, r.Qualified, r.Colo, r.LatencyMS, r.Loss*100, r.SpeedMB, r.RejectReason)
+	}
+
+	if ctx.Err() != nil {
+		report.Canceled = true
+		st := m.currentStatus(s.ID)
+		st.Running = false
+		st.Stage = "已停止"
+		st.Error = ""
+		st.EndedAt = time.Now()
+		st.LastUpdate = time.Now()
+		st.Observed = append([]Result(nil), report.Rows...)
+		st.ObservedTotal = len(report.Rows)
+		m.setStatus(st)
+		m.logf(s.ID, "HEALTH STOPPED checked=%d/%d", report.Checked, len(current))
+		return report
 	}
 
 	st := m.currentStatus(s.ID)
@@ -117,6 +101,59 @@ func (m *Manager) CheckHealth(ctx context.Context, s config.Source, current []Re
 	m.setStatus(st)
 	m.logf(s.ID, "HEALTH DONE checked=%d healthy=%d/%d elapsed=%s", report.Checked, report.Healthy, len(current), time.Since(started).Round(time.Millisecond))
 	return report
+}
+
+func checkHealthOnce(ctx context.Context, s config.Source, old Result) Result {
+	r := old
+	r.TestedAt = time.Now()
+	r.Qualified = false
+	r.SpeedTested = false
+	r.RejectReason = ""
+
+	latency, loss := measureLatencyLoss(ctx, r.IP, s.CFST.Port, maxInt(s.CFST.PingCount, 4))
+	r.LatencyMS = latency
+	r.Loss = loss
+	if ctx.Err() != nil {
+		r.RejectReason = "健康检查：已停止"
+		return r
+	}
+	if loss >= 1 {
+		r.RejectReason = "健康检查：无法连接"
+	} else if s.CFST.LatencyMaxMS > 0 && latency > s.CFST.LatencyMaxMS {
+		r.RejectReason = fmt.Sprintf("健康检查：延迟 %.1fms > %.1fms", latency, s.CFST.LatencyMaxMS)
+	} else if s.CFST.LossMax >= 0 && loss > s.CFST.LossMax {
+		r.RejectReason = fmt.Sprintf("健康检查：丢包 %.0f%% > %.0f%%", loss*100, s.CFST.LossMax*100)
+	} else if len(s.CFST.Colo) > 0 {
+		colo, err := fetchColo(ctx, s, r.IP)
+		if err != nil {
+			r.RejectReason = "健康检查：地区探测失败"
+		} else {
+			r.Colo = colo
+			if !containsColo(s.CFST.Colo, colo) {
+				r.RejectReason = fmt.Sprintf("健康检查：地区 %s 不匹配 %s", colo, strings.Join(s.CFST.Colo, ","))
+			}
+		}
+	} else if strings.TrimSpace(r.Colo) == "" {
+		if colo, err := fetchColo(ctx, s, r.IP); err == nil {
+			r.Colo = colo
+		}
+	}
+	if r.RejectReason == "" {
+		speed, err := measureDownloadSpeed(ctx, s, r.IP)
+		r.SpeedTested = true
+		if err != nil {
+			r.RejectReason = "健康检查：测速失败"
+		} else {
+			r.SpeedMB = speed
+			if s.CFST.SpeedMinMB > 0 && speed < s.CFST.SpeedMinMB {
+				r.RejectReason = fmt.Sprintf("健康检查：速度 %.2fMB/s < %.2fMB/s", speed, s.CFST.SpeedMinMB)
+			}
+		}
+	}
+	if r.RejectReason == "" {
+		r.Qualified = true
+	}
+	return r
 }
 
 func measureLatencyLoss(ctx context.Context, ip string, port, attempts int) (float64, float64) {
@@ -249,28 +286,50 @@ func (m *Manager) MergeResults(sourceID string, healthy, supplemental []Result, 
 	}
 	seen := map[string]bool{}
 	merged := make([]Result, 0, required)
-	add := func(rows []Result) {
-		for _, r := range rows {
-			if !r.Qualified || strings.TrimSpace(r.IP) == "" || seen[r.IP] {
-				continue
-			}
-			seen[r.IP] = true
-			merged = append(merged, r)
+
+	// Health refill is a stability operation, not a new election:
+	// every currently-healthy DNS IP must survive. Only empty slots are filled.
+	for _, r := range healthy {
+		if !r.Qualified || strings.TrimSpace(r.IP) == "" || seen[r.IP] {
+			continue
+		}
+		seen[r.IP] = true
+		merged = append(merged, r)
+		if len(merged) >= required {
+			break
 		}
 	}
-	add(healthy)
-	add(supplemental)
+
+	candidates := make([]Result, 0, len(supplemental))
+	for _, r := range supplemental {
+		if !r.Qualified || strings.TrimSpace(r.IP) == "" || seen[r.IP] {
+			continue
+		}
+		candidates = append(candidates, r)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].SpeedMB == candidates[j].SpeedMB {
+			return candidates[i].LatencyMS < candidates[j].LatencyMS
+		}
+		return candidates[i].SpeedMB > candidates[j].SpeedMB
+	})
+	for _, r := range candidates {
+		if len(merged) >= required {
+			break
+		}
+		seen[r.IP] = true
+		merged = append(merged, r)
+	}
+
+	// Order may change for display/DNS, but membership of healthy survivors does not.
 	sort.SliceStable(merged, func(i, j int) bool {
 		if merged[i].SpeedMB == merged[j].SpeedMB {
 			return merged[i].LatencyMS < merged[j].LatencyMS
 		}
 		return merged[i].SpeedMB > merged[j].SpeedMB
 	})
-	if len(merged) > required {
-		merged = merged[:required]
-	}
 	if len(merged) > 0 {
-		m.SeedResults(sourceID, merged, "启动补位完成")
+		m.SeedResults(sourceID, merged, "健康补位完成")
 	}
 	return merged
 }

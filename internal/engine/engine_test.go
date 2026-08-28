@@ -161,3 +161,47 @@ func TestPatchProgressCarriesPhaseTimer(t *testing.T) {
 	if p.StartedAt.IsZero() || p.ElapsedSeconds < 1 { t.Fatalf("timer not carried: %#v", p) }
 	if p.ETASeconds < 1 { t.Fatalf("eta not computed: %#v", p) }
 }
+
+
+func TestMergeResultsNeverEvictsHealthySurvivors(t *testing.T) {
+	m := NewManager()
+	healthy := []Result{
+		{IP:"1.1.1.1",Qualified:true,SpeedMB:31},
+		{IP:"1.1.1.2",Qualified:true,SpeedMB:32},
+		{IP:"1.1.1.3",Qualified:true,SpeedMB:33},
+		{IP:"1.1.1.4",Qualified:true,SpeedMB:34},
+	}
+	// New candidates are much faster, but health refill must only fill the one missing slot.
+	supp := []Result{
+		{IP:"2.2.2.1",Qualified:true,SpeedMB:100},
+		{IP:"2.2.2.2",Qualified:true,SpeedMB:99},
+		{IP:"2.2.2.3",Qualified:true,SpeedMB:98},
+	}
+	got := m.MergeResults("s", healthy, supp, 5)
+	if len(got) != 5 { t.Fatalf("len=%d",len(got)) }
+	seen:=map[string]bool{}
+	for _,r:=range got { seen[r.IP]=true }
+	for _,ip:=range []string{"1.1.1.1","1.1.1.2","1.1.1.3","1.1.1.4"} {
+		if !seen[ip] { t.Fatalf("healthy survivor %s was evicted: %#v",ip,got) }
+	}
+	nNew:=0
+	for _,r:=range got { if strings.HasPrefix(r.IP,"2.2.2.") { nNew++ } }
+	if nNew!=1 { t.Fatalf("expected exactly 1 refill IP, got %d: %#v",nNew,got) }
+}
+
+func TestStopSourceCancelsActiveRun(t *testing.T) {
+	m:=NewManager()
+	ctx,cancel:=context.WithCancel(context.Background())
+	defer cancel()
+	runCtx,ok:=m.beginRun(ctx,"s")
+	if !ok { t.Fatal("beginRun failed") }
+	done:=make(chan struct{})
+	go func(){ <-runCtx.Done(); close(done) }()
+	if !m.StopSource("s") { t.Fatal("StopSource returned false") }
+	select{
+	case <-done:
+	case <-time.After(time.Second): t.Fatal("cancel did not propagate")
+	}
+	m.endRun("s")
+	if m.IsRunning("s") { t.Fatal("source still running") }
+}

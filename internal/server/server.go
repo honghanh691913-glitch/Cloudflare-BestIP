@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -45,6 +46,7 @@ type App struct {
 	targetStatus map[string]any
 	healthStatus map[string]any
 	lastHealth   map[string]time.Time
+	activeDNS    map[string][]engine.Result
 	updateStatus UpdateState
 	slots        chan struct{}
 }
@@ -57,6 +59,7 @@ func New(store *config.Store, eng *engine.Manager, furnaceStore *furnace.Store) 
 	return &App{
 		Store: store, Engine: eng, Furnace: furnaceStore,
 		targetStatus: map[string]any{}, healthStatus: map[string]any{}, lastHealth: map[string]time.Time{},
+		activeDNS: map[string][]engine.Result{},
 		slots: make(chan struct{}, max),
 	}
 }
@@ -71,6 +74,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/update/apply", a.updateApplyHandler)
 	mux.HandleFunc("/api/provider/test", a.providerTestHandler)
 	mux.HandleFunc("/api/run/source", a.runSourceHandler)
+	mux.HandleFunc("/api/stop/source", a.stopSourceHandler)
 	mux.HandleFunc("/api/run/all", a.runAllHandler)
 	mux.HandleFunc("/api/health/source", a.healthSourceHandler)
 	mux.HandleFunc("/api/sync/target", a.syncTargetHandler)
@@ -105,11 +109,13 @@ func (a *App) statusHandler(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	ts := cloneAnyMap(a.targetStatus)
 	hs := cloneAnyMap(a.healthStatus)
+	active := cloneResultSlices(a.activeDNS)
 	a.mu.Unlock()
 	writeJSON(w, 200, map[string]any{
 		"sources": a.Engine.Snapshot(),
 		"targets": ts,
 		"health":  hs,
+		"active_dns": active,
 		"build":   buildPayload(),
 		"period":  furnace.PeriodName(time.Now()),
 	})
@@ -121,6 +127,26 @@ func cloneAnyMap(in map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+func cloneResultSlices(in map[string][]engine.Result) map[string][]engine.Result {
+	out := make(map[string][]engine.Result, len(in))
+	for k, rows := range in {
+		out[k] = append([]engine.Result(nil), rows...)
+	}
+	return out
+}
+
+func (a *App) setActiveDNS(sourceID string, rows []engine.Result) {
+	a.mu.Lock()
+	a.activeDNS[sourceID] = uniqueResultIPs(rows)
+	a.mu.Unlock()
+}
+
+func (a *App) activeDNSFor(sourceID string) []engine.Result {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]engine.Result(nil), a.activeDNS[sourceID]...)
 }
 
 func buildPayload() map[string]any {
@@ -452,6 +478,31 @@ func (a *App) runSourceHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"ok": true})
 }
 
+func (a *App) stopSourceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(405)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeErr(w, 400, fmt.Errorf("source id required"))
+		return
+	}
+	if !a.Engine.StopSource(id) {
+		writeJSON(w, 200, map[string]any{"ok": true, "running": false, "message": "任务已经停止"})
+		return
+	}
+	a.mu.Lock()
+	if h, ok := a.healthStatus[id].(map[string]any); ok {
+		h["running"] = false
+		h["phase"] = "stopping"
+		h["message"] = "正在停止任务"
+	}
+	a.mu.Unlock()
+	log.Printf("[api] stop requested source=%s", id)
+	writeJSON(w, 202, map[string]any{"ok": true, "running": true, "message": "正在停止任务"})
+}
+
 func (a *App) runAllHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(405)
@@ -483,10 +534,6 @@ func (a *App) healthSourceHandler(w http.ResponseWriter, r *http.Request) {
 	required := requiredCountForSource(c, id)
 	if required < 1 {
 		required = 1
-	}
-	if len(a.Engine.Latest(id)) < required {
-		writeErr(w, 409, fmt.Errorf("当前没有足够的已选 IP 可做健康检查"))
-		return
 	}
 	go a.runHealthCheck(config.PrepareSource(c, src), required, true)
 	writeJSON(w, 202, map[string]any{"ok": true})
@@ -610,11 +657,39 @@ func (a *App) runHealthCheck(s config.Source, required int, autoRefill bool) {
 	if a.Engine.IsRunning(s.ID) {
 		return
 	}
-	latest := a.Engine.Latest(s.ID)
-	if len(latest) < required || required < 1 {
+	if required < 1 {
 		return
 	}
-	current := append([]engine.Result(nil), latest[:required]...)
+	c := a.Store.Get()
+	current := a.activeDNSFor(s.ID)
+	if len(current) < required {
+		readCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		fresh, err := a.refreshActiveDNSForSource(readCtx, c, s.ID)
+		cancel()
+		if err != nil {
+			a.mu.Lock()
+			a.healthStatus[s.ID] = map[string]any{
+				"time": time.Now(), "running": false, "phase": "read_failed", "ok": false,
+				"required": required, "message": "读取 Cloudflare 当前 DNS IP 失败", "error": err.Error(),
+			}
+			a.mu.Unlock()
+			log.Printf("[health] source=%s current DNS read failed: %v", s.ID, err)
+			return
+		}
+		current = fresh
+	}
+	if len(current) > required {
+		current = current[:required]
+	}
+	if len(current) == 0 {
+		a.mu.Lock()
+		a.healthStatus[s.ID] = map[string]any{
+			"time": time.Now(), "running": false, "phase": "no_dns", "ok": false,
+			"required": required, "message": "Cloudflare 当前没有可读取的在用 IP；不会因此自动全量严选",
+		}
+		a.mu.Unlock()
+		return
+	}
 	log.Printf("[health] source=%s checking=%d thresholds latency<=%.0fms loss<=%.2f speed>=%.2fMB/s",
 		s.ID, len(current), s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB)
 
@@ -632,8 +707,20 @@ func (a *App) runHealthCheck(s config.Source, required int, autoRefill bool) {
 	cancel()
 	<-a.slots
 
-	c := a.Store.Get()
+	c = a.Store.Get()
 	a.ingestFurnace(c, s, report.Rows)
+	a.setActiveDNS(s.ID, report.Rows)
+	if report.Canceled {
+		a.mu.Lock()
+		a.healthStatus[s.ID] = map[string]any{
+			"time": time.Now(), "running": false, "phase": "stopped", "ok": false,
+			"checked": report.Checked, "required": required, "rows": report.Rows,
+			"message": "健康检查已停止",
+		}
+		a.mu.Unlock()
+		return
+	}
+
 	healthy := make([]engine.Result, 0, required)
 	for _, row := range report.Rows {
 		if row.Qualified {
@@ -661,6 +748,16 @@ func (a *App) runHealthCheck(s config.Source, required int, autoRefill bool) {
 	need := required - len(healthy)
 	log.Printf("[health] source=%s degraded; automatic refill need=%d", s.ID, need)
 	if err := a.supplementSource(context.Background(), c, s, healthy, required); err != nil {
+		if errors.Is(err, context.Canceled) {
+			a.mu.Lock()
+			a.healthStatus[s.ID] = map[string]any{
+				"time": time.Now(), "running": false, "phase": "stopped", "ok": false,
+				"checked": report.Checked, "healthy": len(healthy), "required": required, "need": need,
+				"rows": report.Rows, "message": "自动补位已停止",
+			}
+			a.mu.Unlock()
+			return
+		}
 		a.mu.Lock()
 		a.healthStatus[s.ID] = map[string]any{
 			"time": time.Now(), "running": false, "phase": "failed", "ok": false,
@@ -722,6 +819,15 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		}
 	}
 	err := a.dns.SyncTarget(ctx, *p, *t, latest)
+	if err == nil {
+		for _, ref := range t.Sources {
+			rows := latest[ref.SourceID]
+			if len(rows) > ref.Count {
+				rows = rows[:ref.Count]
+			}
+			a.setActiveDNS(ref.SourceID, rows)
+		}
+	}
 	if err != nil {
 		log.Printf("[dns] sync failed target=%s host=%s: %v", t.ID, hostname, err)
 	} else {
@@ -795,6 +901,10 @@ func (a *App) BootstrapActiveDNS(ctx context.Context) {
 		}
 	}
 
+	for sourceID, rows := range currentBySource {
+		a.setActiveDNS(sourceID, rows)
+	}
+
 	// Validate each enabled source's active set.
 	for _, raw := range c.Sources {
 		if !raw.Enabled {
@@ -858,6 +968,78 @@ func (a *App) BootstrapActiveDNS(ctx context.Context) {
 		log.Printf("[startup-health] source=%s no active DNS records found; startup full scan skipped", s.ID)
 	}
 	log.Printf("[startup-health] complete")
+}
+
+func (a *App) refreshActiveDNSForSource(ctx context.Context, c config.Config, sourceID string) ([]engine.Result, error) {
+	s, ok := sourceByID(c, sourceID)
+	if !ok {
+		return nil, fmt.Errorf("source not found")
+	}
+	out := []engine.Result{}
+	var lastErr error
+	for _, t := range c.Targets {
+		if !t.Enabled {
+			continue
+		}
+		uses := false
+		for _, ref := range t.Sources {
+			if ref.SourceID == sourceID {
+				uses = true
+				break
+			}
+		}
+		if !uses {
+			continue
+		}
+		var p *config.Provider
+		for i := range c.Providers {
+			if c.Providers[i].ID == t.ProviderID {
+				p = &c.Providers[i]
+				break
+			}
+		}
+		if p == nil {
+			continue
+		}
+		recs, err := a.dns.ListTargetRecords(ctx, *p, t)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		typ := "A"
+		if s.Family == "ipv6" {
+			typ = "AAAA"
+		}
+		// If a target contains multiple sources of the same family, Cloudflare
+		// records do not preserve source provenance. Use the configured slot order.
+		pos := 0
+		for _, ref := range t.Sources {
+			rs, ok := sourceByID(c, ref.SourceID)
+			if !ok || rs.Family != s.Family {
+				continue
+			}
+			start := pos
+			end := start + ref.Count
+			if end > len(recs[typ]) {
+				end = len(recs[typ])
+			}
+			if ref.SourceID == sourceID {
+				for _, ip := range recs[typ][start:end] {
+					out = append(out, engine.Result{IP: ip, Family: s.Family, Qualified: true})
+				}
+			}
+			pos += ref.Count
+		}
+	}
+	out = uniqueResultIPs(out)
+	if len(out) > 0 {
+		a.setActiveDNS(sourceID, out)
+		return out, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return out, nil
 }
 
 func uniqueResultIPs(in []engine.Result) []engine.Result {
@@ -927,6 +1109,9 @@ func (a *App) supplementSource(ctx context.Context, c config.Config, s config.So
 		cancel()
 		<-a.slots
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
 			log.Printf("[startup-health] source=%s supplement sample=%d failed: %v", s.ID, n, err)
 			if n >= full {
 				return err
@@ -1028,7 +1213,7 @@ func (a *App) Scheduler(ctx context.Context) {
 					continue
 				}
 				required := requiredCountForSource(c, s.ID)
-				if required < 1 || len(a.Engine.Latest(s.ID)) < required {
+				if required < 1 {
 					continue
 				}
 				if time.Since(a.healthTime(s.ID)) >= time.Duration(c.HealthCheckMinutes)*time.Minute {

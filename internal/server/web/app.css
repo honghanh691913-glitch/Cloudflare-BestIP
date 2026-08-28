@@ -52,3 +52,15 @@ button,input,select,textarea{font:inherit}.primary,.ghost,.icon-btn,.more,.run,.
 @media (max-width:600px){.active-ip-card{margin-left:-2px;margin-right:-2px;padding:8px}.active-ip-row{grid-template-columns:1fr;gap:4px}.active-ip-row>div:last-child{justify-content:flex-start;flex-wrap:wrap}.flow-steps{grid-template-columns:repeat(2,1fr)}.progress-meta{align-items:flex-start;flex-direction:column;gap:2px}}
 
 .furnace-rule-card{position:relative}.furnace-rule-task{display:flex;align-items:center;gap:7px;padding:0 0 9px;margin-bottom:9px;border-bottom:1px dashed var(--line)}.furnace-rule-task .mini-label{flex:0 0 auto}.furnace-rule-task b{font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dcecff}
+
+/* v0.6.8: running scan button doubles as an immediate stop control. */
+.run-busy .run-stop{display:none}
+.run-busy{cursor:pointer}
+@media (hover:hover) and (pointer:fine){
+  .run-busy:hover .run-normal{display:none}
+  .run-busy:hover .run-stop{display:inline}
+}
+@media (hover:none), (pointer:coarse){
+  .run-busy .run-normal{display:inline}
+  .run-busy .run-stop{display:none}
+}
