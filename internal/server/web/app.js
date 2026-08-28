@@ -10,6 +10,8 @@ let furnaceData = {profiles:[],rules:[],period:'day'};
 let furnaceSourceFilter = 'all';
 let furnaceShowGray = false;
 let furnaceLoadedAt = 0;
+let updateRunTimer = null;
+let updateRunState = null;
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -185,13 +187,16 @@ function renderSettings(){
   const checkOK=updateCheck?.check_ok!==false;
   const latest=updateCheck?.latest_commit?shortCommit(updateCheck.latest_commit):(updateCheck?.latest_version||'未检查');
   const source=updateCheck?.check_source&&updateCheck.check_source!=='unavailable'?` · ${updateCheck.check_source}`:'';
-  const stateText=!updateCheck?'版本状态':(checkOK?(available?'有新版本':'已检查'):'网络受限');
-  const note=!updateCheck
+  const running=!!updateRunState?.running;
+  const stateText=running?'更新中':(!updateCheck?'版本状态':(checkOK?(available?'有新版本':'已检查'):'网络受限'));
+  const baseNote=!updateCheck
     ?(ready?'Web 一键更新已启用。检查失败时仍可直接强制拉取 latest。':'未挂载 Docker Socket，只能检查版本。')
     :(updateCheck.check_error
       ?`无法连接版本源，但不会影响“强制拉取 latest”。${updateCheck.check_error}`
       :(updateCheck.check_warning|| (ready?'版本检查完成。':'版本检查完成；未启用 Web 更新。')));
-  panel.innerHTML=`<div class="settings-card"><div class="update-head"><div><div class="mini-label">当前版本</div><div class="version-title">${esc(buildInfo.version||'dev')} <span>${esc(shortCommit(buildInfo.commit))}</span></div><div class="help">构建 ${esc(buildInfo.built_at||'unknown')} · 最新 ${esc(latest)}${esc(source)}</div></div><span class="update-state ${available?'available':''}">${esc(stateText)}</span></div><div id="updateMessage" class="modal-note">${esc(note)}</div><div class="grid2 update-actions"><button id="checkUpdateBtn" class="ghost">检查更新</button><button id="applyUpdateBtn" class="primary" ${ready?'':'disabled'}>${available?'更新到最新版':'强制拉取 latest'}</button></div></div>
+  const note=running?(updateRunState.message||'更新进行中…'):(updateRunState?.error?`更新失败：${updateRunState.error}`:baseNote);
+  const updateButtonText=running?'正在更新…':(available?'更新到最新版':'强制拉取 latest');
+  panel.innerHTML=`<div class="settings-card"><div class="update-head"><div><div class="mini-label">当前版本</div><div class="version-title">${esc(buildInfo.version||'dev')} <span>${esc(shortCommit(buildInfo.commit))}</span></div><div class="help">构建 ${esc(buildInfo.built_at||'unknown')} · 最新 ${esc(latest)}${esc(source)}</div></div><span class="update-state ${available?'available':''}">${esc(stateText)}</span></div><div id="updateMessage" class="modal-note">${esc(note)}</div>${running?`<div class="progress-bar" style="margin:9px 0"><i class="indeterminate-progress"></i></div><div class="help">阶段：${esc(updateRunState.stage||'准备')} · 已用时 ${Math.max(0,Math.floor((Date.now()-new Date(updateRunState.started_at||Date.now()).getTime())/1000))} 秒</div>`:''}<div class="grid2 update-actions"><button id="checkUpdateBtn" class="ghost" ${running?'disabled':''}>检查更新</button><button id="applyUpdateBtn" class="primary" ${ready&&!running?'':'disabled'}>${esc(updateButtonText)}</button></div></div>
   <div class="settings-card"><h3>全局测速网络</h3><div class="modal-note"><b>初筛固定 TCPing 443</b>：不再使用 HTTPing，避免 Host / SNI / HEAD 状态码造成“256 个全部不可用”的假失败。</div><label class="field"><span>Colo 地区探测地址</span><input id="setProbeURL" value="${esc(cfg.probe_url||DEFAULT_PROBE_URL)}"><small>只用于 NRT/HKG 等地区识别；如果没有真正返回 colo，程序会自动回退 Cloudflare 官方 trace。</small></label><label class="field"><span>下载测速地址</span><input id="setSpeedURL" value="${esc(cfg.speed_url||DEFAULT_SPEED_URL)}"><small>默认 CM：cf.090227.xyz，避免把 Cloudflare 官方下载源作为长期高频测速源。线路高级设置可单独覆盖。</small></label><div class="grid2"><label class="field"><span>健康检查周期 / 分钟</span><input id="setHealth" type="number" min="1" value="${Number(cfg.health_check_minutes||60)}"></label><label class="field"><span>单线路最大采样数</span><input id="setMaxSample" type="number" min="1" max="100000" value="${Number(cfg.max_sample_count||10000)}"></label></div><div class="modal-note">健康检查会同时复核当前在用 IP 的 <b>延迟 + 丢包 + 网速 + 地区</b>。任一不达标就触发完整严选替换，不再只看延迟。</div></div>
   <div class="settings-card"><h3>熔炉学习</h3><div class="switch-line"><div><b style="font-size:10px">分时段历史加权</b><span class="help">成熟后只在本轮新鲜合格 IP 中按日/夜历史表现重排，不会复活失效 IP。</span></div><input id="setFurnaceRank" class="switch" type="checkbox" ${cfg.furnace_auto_rank?'checked':''}></div><div class="grid2" style="margin-top:9px"><label class="field"><span>历史保留 / 天</span><input id="setRetention" type="number" min="7" max="365" value="${Number(cfg.furnace_retention_days||45)}"></label><label class="field"><span>最大并发任务</span><input id="setConcurrency" type="number" min="1" max="16" value="${Number(cfg.max_concurrency||2)}"></label></div></div>
   <button id="saveGlobal" class="primary" style="width:100%;padding:10px;margin-bottom:9px">保存全局设置</button>
@@ -203,8 +208,81 @@ function renderSettings(){
 }
 
 async function checkForUpdate(){const m=$('#updateMessage');if(m)m.textContent='正在检查版本源…';try{updateCheck=await api('/api/update/check?ts='+Date.now());buildInfo=updateCheck.current||buildInfo;renderVersionBadge();renderSettings();if(updateCheck.check_ok===false)toast('版本源暂时不可达，可直接强制拉取 latest',true);else toast(updateCheck.update_available?'发现新版本':`已完成检查 · ${updateCheck.check_source||'版本源'}`)}catch(e){toast(`检查更新异常：${e.message}；仍可强制拉取 latest`,true)}}
-async function applyWebUpdate(){if(!buildInfo.web_update_ready)return toast('当前未启用 Web 更新',true);if(!confirm('将直接从 GHCR 拉取 latest 并重建容器，不依赖 GitHub API 检查结果。页面会短暂断开，继续吗？'))return;const old=String(buildInfo.commit||'');try{await api('/api/update/apply',{method:'POST'});toast('已启动更新，等待重新上线');waitForUpdatedService(old)}catch(e){toast(`更新失败：${e.message}`,true)}}
-function waitForUpdatedService(old){let n=0;const timer=setInterval(async()=>{n++;try{const x=await api('/api/version?ts='+Date.now());if(x?.commit&&(x.commit!==old||n>5)){clearInterval(timer);buildInfo=x;renderVersionBadge();toast(`更新完成：${x.version} · ${shortCommit(x.commit)}`);setTimeout(()=>location.reload(),700)}}catch{}if(n>=80){clearInterval(timer);toast('更新等待超时，请手动刷新确认',true)}},2500)}
+
+async function applyWebUpdate(){
+  if(!buildInfo.web_update_ready)return toast('当前未启用 Web 更新',true);
+  if(!confirm('将直接从 GHCR 拉取 latest 并重建容器。页面会短暂断开，继续吗？'))return;
+  const old=String(buildInfo.commit||'');
+  updateRunState={running:true,stage:'submitting',message:'正在提交更新请求…',started_at:new Date().toISOString()};
+  renderSettings();
+  toast('更新请求已提交');
+  try{
+    const r=await api('/api/update/apply',{method:'POST'});
+    updateRunState={...(r.state||updateRunState),running:true,stage:r.state?.stage||'pulling',message:r.message||'后台正在拉取 latest 镜像'};
+    renderSettings();
+    monitorWebUpdate(old);
+  }catch(e){
+    updateRunState={running:false,stage:'failed',error:e.message,message:'更新启动失败'};
+    renderSettings();
+    toast(`更新启动失败：${e.message}`,true);
+  }
+}
+
+function monitorWebUpdate(old){
+  clearInterval(updateRunTimer);
+  let misses=0;
+  updateRunTimer=setInterval(async()=>{
+    try{
+      const st=await api('/api/update/status?ts='+Date.now());
+      misses=0;
+      updateRunState=st||updateRunState;
+      if(currentView==='settings')renderSettings();
+      if(st?.error){
+        clearInterval(updateRunTimer);
+        toast(`更新失败：${st.error}`,true);
+        return;
+      }
+      if(st?.stage==='restarting'){
+        // The helper will replace this container in about 2 seconds.
+        clearInterval(updateRunTimer);
+        waitForUpdatedService(old);
+      }
+    }catch{
+      misses++;
+      // A disconnect after the pull usually means the helper is replacing us.
+      if(misses>=2){
+        clearInterval(updateRunTimer);
+        waitForUpdatedService(old);
+      }
+    }
+  },1200);
+}
+
+function waitForUpdatedService(old){
+  let n=0;
+  updateRunState={running:true,stage:'restarting',message:'容器正在重启，等待 Web 恢复…',started_at:updateRunState?.started_at||new Date().toISOString()};
+  if(currentView==='settings')renderSettings();
+  const timer=setInterval(async()=>{
+    n++;
+    try{
+      const x=await api('/api/version?ts='+Date.now());
+      if(x?.commit&&(x.commit!==old||n>5)){
+        clearInterval(timer);
+        buildInfo=x;
+        updateRunState={running:false,stage:'done',message:`更新完成：${x.version} · ${shortCommit(x.commit)}`};
+        renderVersionBadge();
+        toast(updateRunState.message);
+        setTimeout(()=>location.reload(),700);
+      }
+    }catch{}
+    if(n>=120){
+      clearInterval(timer);
+      updateRunState={running:false,stage:'timeout',error:'等待新容器上线超时，请查看 Docker 日志'};
+      if(currentView==='settings')renderSettings();
+      toast('更新等待超时，请查看 Docker 日志',true);
+    }
+  },2000);
+}
 async function saveConfig(okText='已保存'){try{await api('/api/config',{method:'PUT',body:JSON.stringify(cfg)});toast(okText);renderWithUIState(()=>renderAll());return true}catch(e){toast(`保存失败：${e.message}`,true);return false}}
 
 function openTaskEditor(targetId=''){

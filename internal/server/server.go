@@ -26,6 +26,15 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+type UpdateState struct {
+	Running   bool      `json:"running"`
+	Stage     string    `json:"stage,omitempty"`
+	Message   string    `json:"message,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
 type App struct {
 	Store   *config.Store
 	Engine  *engine.Manager
@@ -36,6 +45,7 @@ type App struct {
 	targetStatus map[string]any
 	healthStatus map[string]any
 	lastHealth   map[string]time.Time
+	updateStatus UpdateState
 	slots        chan struct{}
 }
 
@@ -57,6 +67,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/status", a.statusHandler)
 	mux.HandleFunc("/api/version", a.versionHandler)
 	mux.HandleFunc("/api/update/check", a.updateCheckHandler)
+	mux.HandleFunc("/api/update/status", a.updateStatusHandler)
 	mux.HandleFunc("/api/update/apply", a.updateApplyHandler)
 	mux.HandleFunc("/api/provider/test", a.providerTestHandler)
 	mux.HandleFunc("/api/run/source", a.runSourceHandler)
@@ -285,15 +296,72 @@ func (a *App) updateCheckHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) setUpdateState(st UpdateState) {
+	a.mu.Lock()
+	if st.UpdatedAt.IsZero() {
+		st.UpdatedAt = time.Now()
+	}
+	a.updateStatus = st
+	a.mu.Unlock()
+}
+
+func (a *App) patchUpdateState(stage, message, errText string, running bool) {
+	a.mu.Lock()
+	st := a.updateStatus
+	if st.StartedAt.IsZero() {
+		st.StartedAt = time.Now()
+	}
+	st.Running = running
+	st.Stage = stage
+	st.Message = message
+	st.Error = errText
+	st.UpdatedAt = time.Now()
+	a.updateStatus = st
+	a.mu.Unlock()
+}
+
+func (a *App) updateStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(405)
+		return
+	}
+	a.mu.Lock()
+	st := a.updateStatus
+	a.mu.Unlock()
+	writeJSON(w, 200, st)
+}
+
 func (a *App) updateApplyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(405)
 		return
 	}
 	if !updater.Available() {
-		writeErr(w, 409, fmt.Errorf("Web 一键更新未启用：请使用新版 Compose 挂载 /var/run/docker.sock"))
+		writeErr(w, 409, fmt.Errorf("Web 一键更新未启用：请挂载 /var/run/docker.sock"))
 		return
 	}
+
+	a.mu.Lock()
+	if a.updateStatus.Running {
+		st := a.updateStatus
+		a.mu.Unlock()
+		writeJSON(w, 202, map[string]any{
+			"ok": true,
+			"message": "更新任务已经在运行",
+			"state": st,
+		})
+		return
+	}
+	now := time.Now()
+	a.updateStatus = UpdateState{
+		Running: true,
+		Stage: "queued",
+		Message: "更新请求已提交，准备连接 Docker Engine",
+		StartedAt: now,
+		UpdatedAt: now,
+	}
+	a.mu.Unlock()
+
 	target := os.Getenv("BESTIP_CONTAINER_NAME")
 	if target == "" {
 		target = "bestip-manager"
@@ -302,22 +370,50 @@ func (a *App) updateApplyHandler(w http.ResponseWriter, r *http.Request) {
 	if image == "" {
 		image = buildinfo.Image
 	}
-	client, err := updater.NewClient()
-	if err != nil {
-		writeErr(w, 500, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-	if err := client.TriggerUpdate(ctx, target, image); err != nil {
-		writeErr(w, 500, err)
-		return
-	}
+
+	log.Printf("[update] requested target=%s image=%s current=%s/%s",
+		target, image, buildinfo.Version, buildinfo.Commit)
+
+	go a.performWebUpdate(target, image)
+
+	// Return immediately. Image pulling may take minutes on some NAS/ISP routes,
+	// and the Web UI can now poll /api/update/status instead of appearing frozen.
 	writeJSON(w, 202, map[string]any{
 		"ok":      true,
-		"message": "已拉取最新版并启动更新助手，Web 将短暂断开后自动恢复",
+		"message": "更新已进入后台；正在拉取 GHCR latest",
 		"image":   image,
 	})
+}
+
+func (a *App) performWebUpdate(target, image string) {
+	a.patchUpdateState("docker", "正在连接 Docker Engine", "", true)
+	log.Printf("[update] connecting docker engine")
+	client, err := updater.NewClient()
+	if err != nil {
+		msg := compactUpdateError(err)
+		a.patchUpdateState("failed", "连接 Docker Engine 失败", msg, false)
+		log.Printf("[update] docker connection failed: %v", err)
+		return
+	}
+
+	// TriggerUpdate first pulls the entire image, then creates/starts a helper
+	// container. This is the slowest stage, so surface it explicitly.
+	a.patchUpdateState("pulling", "正在从 GHCR 拉取 latest 镜像；首次或镜像较大时可能需要几分钟", "", true)
+	log.Printf("[update] pulling image=%s", image)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	if err := client.TriggerUpdate(ctx, target, image); err != nil {
+		msg := compactUpdateError(err)
+		a.patchUpdateState("failed", "镜像拉取或更新助手启动失败", msg, false)
+		log.Printf("[update] trigger failed: %v", err)
+		return
+	}
+
+	// The helper sleeps briefly, then replaces this container. This state may
+	// only be visible for 1-2 polls before the service disconnects, which is OK.
+	a.patchUpdateState("restarting", "镜像已拉取，正在重建容器；页面即将短暂断开", "", true)
+	log.Printf("[update] helper started; container restart imminent")
 }
 
 func (a *App) providerTestHandler(w http.ResponseWriter, r *http.Request) {
