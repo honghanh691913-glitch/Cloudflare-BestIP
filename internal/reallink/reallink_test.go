@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -111,5 +113,26 @@ func TestV073RealDelayUsesMinLikeV2rayN(t *testing.T) {
 	}
 	if values[0] > 60 {
 		t.Fatalf("minimum sample unexpectedly high: %#v", values)
+	}
+}
+
+func TestV075SpeedWarmupURL(t *testing.T) {
+	raw := "https://cf.090227.xyz/__down?bytes=99999999"
+	got, ok := speedWarmupURL(raw, 262144)
+	if !ok {
+		t.Fatal("expected bytes endpoint to support warmup")
+	}
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Query().Get("bytes") != strconv.Itoa(262144) {
+		t.Fatalf("warmup bytes=%q", u.Query().Get("bytes"))
+	}
+}
+
+func TestV075GenericSpeedURLDoesNotInventBytes(t *testing.T) {
+	if got, ok := speedWarmupURL("https://example.com/file.bin", 262144); ok || got != "" {
+		t.Fatalf("unexpected warmup rewrite: %q %v", got, ok)
 	}
 }

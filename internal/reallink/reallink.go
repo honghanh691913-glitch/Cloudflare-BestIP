@@ -367,6 +367,55 @@ func doLatencyRequestWithClient(ctx context.Context, client *http.Client, testUR
 	return nil
 }
 
+func speedWarmupURL(raw string, warmBytes int64) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	q := u.Query()
+	if q.Get("bytes") == "" {
+		return "", false
+	}
+	q.Set("bytes", strconv.FormatInt(warmBytes, 10))
+	u.RawQuery = q.Encode()
+	return u.String(), true
+}
+
+func doSpeedWarmup(ctx context.Context, client *http.Client, speedURL string) error {
+	if u, ok := speedWarmupURL(speedURL, 256*1024); ok {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "BestIP-RealSpeed/2")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("真测速热身地址返回 HTTP %s", resp.Status)
+		}
+		_, err = io.Copy(io.Discard, resp.Body)
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, speedURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "BestIP-RealSpeed/2")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusMethodNotAllowed {
+		return fmt.Errorf("真测速热身地址返回 HTTP %s", resp.Status)
+	}
+	return nil
+}
+
 func MeasureSpeed(ctx context.Context, p config.RealProfile, candidate, speedURL string, bytesMB int) (float64, error) {
 	if strings.TrimSpace(speedURL) == "" {
 		speedURL = config.DefaultSpeedURL
@@ -379,20 +428,28 @@ func MeasureSpeed(ctx context.Context, p config.RealProfile, candidate, speedURL
 	}
 	limit := int64(bytesMB) * 1024 * 1024
 	var measured float64
+
 	err := withProxy(ctx, p, candidate, func(proxyURL *url.URL) error {
 		tr := &http.Transport{
 			Proxy:                 http.ProxyURL(proxyURL),
-			DisableKeepAlives:     true,
 			TLSHandshakeTimeout:   8 * time.Second,
 			ResponseHeaderTimeout: 10 * time.Second,
+			IdleConnTimeout:       30 * time.Second,
+			MaxIdleConns:          2,
+			MaxIdleConnsPerHost:   2,
 		}
 		defer tr.CloseIdleConnections()
-		client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+		client := &http.Client{Transport: tr, Timeout: 40 * time.Second}
+
+		// Warm-up is excluded from throughput timing. The default __down URL
+		// only downloads 256 KB here and the same pooled connection can be reused.
+		_ = doSpeedWarmup(ctx, client, speedURL)
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, speedURL, nil)
 		if err != nil {
 			return err
 		}
-		req.Header.Set("User-Agent", "BestIP-RealSpeed/1")
+		req.Header.Set("User-Agent", "BestIP-RealSpeed/2")
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
@@ -492,7 +549,7 @@ func withProxy(ctx context.Context, p config.RealProfile, candidate string, fn f
 		case <-time.After(80 * time.Millisecond):
 		}
 	}
-	proxyURL, _ := url.Parse("http://" + addr)
+	proxyURL, _ := url.Parse("socks5://" + addr)
 	return fn(proxyURL)
 }
 

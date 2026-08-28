@@ -198,9 +198,9 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 		Observed: []Result{},
 		Logs:     []string{},
 	})
-	m.logf(s.ID, "STRICT START name=%q family=%s inputs=%d sample=%d colo=%s thresholds(latency<=%.0fms loss<=%.2f speed>=%.2fMB/s)",
+	m.logf(s.ID, "STRICT START name=%q family=%s inputs=%d sample=%d colo=%s thresholds(tcp<=%.0fms loss<=%.2f direct_speed>=%.2fMB/s real<=%.0fms real_speed>=%.2fMB/s)",
 		s.Name, s.Family, len(s.Inputs), s.SampleCount, strings.Join(s.CFST.Colo, ","),
-		s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB)
+		s.CFST.LatencyMaxMS, s.CFST.LossMax, s.CFST.SpeedMinMB, s.RealLatencyMaxMS, s.RealSpeedMinMB)
 
 	workdir, err := os.MkdirTemp("", "bestip-"+sanitize(s.ID)+"-")
 	if err != nil {
@@ -433,7 +433,7 @@ func (m *Manager) RunSource(ctx context.Context, s config.Source) error {
 		m.patchStage(s.ID, "真测速决赛")
 		qualified = m.applyRealSpeed(ctx, s.ID, s, qualified)
 		if len(qualified) == 0 {
-			return m.fail(s.ID, fmt.Errorf("真测速完成，但没有候选达到真速度要求"))
+			return m.fail(s.ID, fmt.Errorf("本轮没有候选达到真速度要求；现有 DNS 保持不变"))
 		}
 	}
 
