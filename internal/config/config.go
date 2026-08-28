@@ -197,7 +197,42 @@ func ApplyDefaults(c *Config) {
 			s.CFST.DownloadTime = 10
 		}
 	}
+	pruneOrphanTaskSources(c)
 	c.Version = 2
+}
+
+// pruneOrphanTaskSources keeps the config aligned with the Web model where
+// IP sources are owned/referenced by domain tasks. Editing a task used to be
+// able to leave an old Source behind, which then appeared as a phantom furnace
+// rule even though no task used it. Preserve standalone sources only when there
+// are no tasks at all (legacy/manual configs).
+func pruneOrphanTaskSources(c *Config) {
+	if c == nil || len(c.Targets) == 0 {
+		return
+	}
+	used := map[string]bool{}
+	for _, t := range c.Targets {
+		for _, ref := range t.Sources {
+			if strings.TrimSpace(ref.SourceID) != "" {
+				used[ref.SourceID] = true
+			}
+		}
+	}
+	keptSources := c.Sources[:0]
+	for _, src := range c.Sources {
+		if used[src.ID] {
+			keptSources = append(keptSources, src)
+		}
+	}
+	c.Sources = keptSources
+
+	keptRules := c.FurnaceRules[:0]
+	for _, rule := range c.FurnaceRules {
+		if used[rule.SourceID] {
+			keptRules = append(keptRules, rule)
+		}
+	}
+	c.FurnaceRules = keptRules
 }
 
 func legacyIPv4Capacity(inputs []string, max int) int {

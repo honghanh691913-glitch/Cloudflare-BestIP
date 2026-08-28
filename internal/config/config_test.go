@@ -44,3 +44,38 @@ func TestApplyDefaultsMigratesLegacyThreadPingFields(t *testing.T) {
 		t.Fatalf("legacy migration failed: threads=%d ping_count=%d", c.Sources[0].CFST.Threads, c.Sources[0].CFST.PingCount)
 	}
 }
+
+func TestApplyDefaultsPrunesOrphanTaskSources(t *testing.T) {
+	c := Config{
+		Listen: ":8080", MaxSampleCount: 10000,
+		Sources: []Source{
+			{ID: "v4", Family: "ipv4", SampleCount: 256},
+			{ID: "v6", Family: "ipv6", SampleCount: 256},
+			{ID: "old-v6", Family: "ipv6", SampleCount: 256},
+		},
+		Targets: []Target{
+			{ID: "t4", Sources: []TargetRef{{SourceID: "v4", Count: 5}}},
+			{ID: "t6", Sources: []TargetRef{{SourceID: "v6", Count: 5}}},
+		},
+		FurnaceRules: []FurnaceRule{
+			{SourceID: "v4", Enabled: true},
+			{SourceID: "v6", Enabled: true},
+			{SourceID: "old-v6", Enabled: true},
+		},
+	}
+	ApplyDefaults(&c)
+	if len(c.Sources) != 2 {
+		t.Fatalf("sources=%d want 2: %#v", len(c.Sources), c.Sources)
+	}
+	if len(c.FurnaceRules) != 2 {
+		t.Fatalf("rules=%d want 2: %#v", len(c.FurnaceRules), c.FurnaceRules)
+	}
+}
+
+func TestApplyDefaultsKeepsStandaloneSourcesWhenNoTasks(t *testing.T) {
+	c := Config{Listen: ":8080", MaxSampleCount: 10000, Sources: []Source{{ID: "standalone", Family: "ipv4", SampleCount: 256}}}
+	ApplyDefaults(&c)
+	if len(c.Sources) != 1 || c.Sources[0].ID != "standalone" {
+		t.Fatalf("standalone source unexpectedly pruned: %#v", c.Sources)
+	}
+}
