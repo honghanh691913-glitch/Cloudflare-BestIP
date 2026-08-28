@@ -1303,6 +1303,102 @@ func buildArgs(s config.Source, inputFile, outFile string) []string {
 	return args
 }
 
+type normalizedInput struct {
+	Value     string
+	Decorated bool
+}
+
+func normalizeInputEntry(raw, family string) (normalizedInput, bool) {
+	original := strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	if original == "" {
+		return normalizedInput{}, false
+	}
+	if strings.HasPrefix(original, "#") || strings.HasPrefix(original, ";") {
+		return normalizedInput{}, false
+	}
+
+	v := original
+	if i := strings.Index(v, "#"); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.Index(v, ";"); i >= 0 {
+		v = v[:i]
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return normalizedInput{}, false
+	}
+
+	candidates := []string{v}
+	if fields := strings.Fields(v); len(fields) > 1 {
+		candidates = append(candidates, fields[0])
+	}
+	for _, sep := range []string{",", "|", "\t"} {
+		if i := strings.Index(v, sep); i > 0 {
+			candidates = append(candidates, strings.TrimSpace(v[:i]))
+		}
+	}
+
+	seen := map[string]bool{}
+	for _, cand := range candidates {
+		cand = strings.TrimSpace(cand)
+		if cand == "" || seen[cand] {
+			continue
+		}
+		seen[cand] = true
+
+		if ip, network, err := net.ParseCIDR(cand); err == nil && ip != nil {
+			if family == "ipv4" && ip.To4() == nil {
+				continue
+			}
+			if family == "ipv6" && ip.To4() != nil {
+				continue
+			}
+			value := network.String()
+			return normalizedInput{Value: value, Decorated: value != original}, true
+		}
+
+		plain := strings.Trim(cand, "[]")
+		if ip := net.ParseIP(plain); ip != nil {
+			if family == "ipv4" && ip.To4() == nil {
+				continue
+			}
+			if family == "ipv6" && ip.To4() != nil {
+				continue
+			}
+			value := ip.String()
+			return normalizedInput{Value: value, Decorated: value != original}, true
+		}
+
+		// IPv4:443 and [IPv6]:443
+		if host, port, err := net.SplitHostPort(cand); err == nil {
+			if p, err := strconv.Atoi(port); err == nil && p >= 1 && p <= 65535 {
+				host = strings.Trim(host, "[]")
+				if ip := net.ParseIP(host); ip != nil {
+					if family == "ipv4" && ip.To4() == nil {
+						continue
+					}
+					if family == "ipv6" && ip.To4() != nil {
+						continue
+					}
+					return normalizedInput{Value: ip.String(), Decorated: true}, true
+				}
+			}
+		}
+
+		// Fallback for IPv4:port.
+		if i := strings.LastIndex(cand, ":"); i > 0 {
+			host, port := cand[:i], cand[i+1:]
+			if p, err := strconv.Atoi(port); err == nil && p >= 1 && p <= 65535 {
+				if ip := net.ParseIP(host); ip != nil && ip.To4() != nil && family == "ipv4" {
+					return normalizedInput{Value: ip.String(), Decorated: true}, true
+				}
+			}
+		}
+	}
+	return normalizedInput{}, false
+}
+
 func collectInputs(ctx context.Context, s config.Source, outPath string) (int, error) {
 	f, err := os.Create(outPath)
 	if err != nil {
@@ -1311,12 +1407,38 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 	defer f.Close()
 	w := bufio.NewWriter(f)
 	defer w.Flush()
+
 	seen := map[string]bool{}
+	rawCount := 0
+	decoratedCount := 0
+	invalidCount := 0
+
+	addLine := func(line string) {
+		raw := strings.TrimSpace(line)
+		if raw == "" || strings.HasPrefix(raw, "#") || strings.HasPrefix(raw, ";") {
+			return
+		}
+		rawCount++
+		norm, ok := normalizeInputEntry(raw, s.Family)
+		if !ok {
+			invalidCount++
+			return
+		}
+		if norm.Decorated {
+			decoratedCount++
+		}
+		if !seen[norm.Value] {
+			seen[norm.Value] = true
+			fmt.Fprintln(w, norm.Value)
+		}
+	}
+
 	for _, in := range s.Inputs {
 		in = strings.TrimSpace(in)
 		if in == "" {
 			continue
 		}
+
 		var r io.ReadCloser
 		if strings.HasPrefix(in, "http://") || strings.HasPrefix(in, "https://") {
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, in, nil)
@@ -1336,25 +1458,21 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 			}
 			r = rf
 		} else {
-			lines := []string{in}
-			for _, line := range lines {
-				if validForFamily(line, s.Family) && !seen[line] {
-					seen[line] = true
-					fmt.Fprintln(w, line)
-				}
+			sc := bufio.NewScanner(strings.NewReader(in))
+			sc.Buffer(make([]byte, 64*1024), 1024*1024)
+			for sc.Scan() {
+				addLine(sc.Text())
+			}
+			if err := sc.Err(); err != nil {
+				return 0, err
 			}
 			continue
 		}
+
 		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
 		for sc.Scan() {
-			line := strings.TrimSpace(strings.Split(sc.Text(), "#")[0])
-			if line == "" {
-				continue
-			}
-			if validForFamily(line, s.Family) && !seen[line] {
-				seen[line] = true
-				fmt.Fprintln(w, line)
-			}
+			addLine(sc.Text())
 		}
 		err = sc.Err()
 		r.Close()
@@ -1362,25 +1480,21 @@ func collectInputs(ctx context.Context, s config.Source, outPath string) (int, e
 			return 0, err
 		}
 	}
+
 	if len(seen) == 0 {
-		return 0, fmt.Errorf("source %s produced no valid %s inputs", s.ID, s.Family)
+		return 0, fmt.Errorf(
+			"source %s produced no valid %s inputs (raw=%d invalid=%d); 支持 IP、CIDR、IP:端口#备注、[IPv6]:端口#备注 和 URL",
+			s.ID, s.Family, rawCount, invalidCount,
+		)
 	}
+	log.Printf("[input:%s] normalized raw=%d valid_unique=%d decorated=%d invalid=%d family=%s",
+		s.ID, rawCount, len(seen), decoratedCount, invalidCount, s.Family)
 	return len(seen), nil
 }
 
 func validForFamily(v, family string) bool {
-	base := v
-	if i := strings.Index(v, "/"); i >= 0 {
-		base = v[:i]
-	}
-	ip := net.ParseIP(strings.TrimSpace(base))
-	if ip == nil {
-		return false
-	}
-	if family == "ipv4" {
-		return ip.To4() != nil
-	}
-	return ip.To4() == nil
+	_, ok := normalizeInputEntry(v, family)
+	return ok
 }
 
 // diagnoseIPv6Egress distinguishes "the sampled prefix has no usable IP" from

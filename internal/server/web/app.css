@@ -64,3 +64,5 @@ button,input,select,textarea{font:inherit}.primary,.ghost,.icon-btn,.more,.run,.
   .run-busy .run-normal{display:inline}
   .run-busy .run-stop{display:none}
 }
+
+.bad-text{color:var(--danger,#ff6677)}

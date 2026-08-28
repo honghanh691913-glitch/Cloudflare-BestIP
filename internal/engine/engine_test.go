@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"reflect"
+	"path/filepath"
+	"os"
 	"context"
 	"fmt"
 	"net"
@@ -204,4 +207,72 @@ func TestStopSourceCancelsActiveRun(t *testing.T) {
 	}
 	m.endRun("s")
 	if m.IsRunning("s") { t.Fatal("source still running") }
+}
+
+
+func TestNormalizeDecoratedIPInput(t *testing.T) {
+	cases := []struct {
+		raw, family, want string
+	}{
+		{"190.93.246.167:443#46.08MB/s-LAX", "ipv4", "190.93.246.167"},
+		{"104.16.146.116:443#45.87MB/s-LAX", "ipv4", "104.16.146.116"},
+		{"1.1.1.1#NRT", "ipv4", "1.1.1.1"},
+		{"172.64.229.123/24#pool", "ipv4", "172.64.229.0/24"},
+		{"[2606:4700:4700::1111]:443#NRT", "ipv6", "2606:4700:4700::1111"},
+		{"2606:4700:5a::/48#NRT", "ipv6", "2606:4700:5a::/48"},
+	}
+	for _, tc := range cases {
+		got, ok := normalizeInputEntry(tc.raw, tc.family)
+		if !ok {
+			t.Fatalf("failed to parse %q", tc.raw)
+		}
+		if got.Value != tc.want {
+			t.Fatalf("%q => %q, want %q", tc.raw, got.Value, tc.want)
+		}
+	}
+}
+
+func TestCollectInputsDecoratedBestIPList(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "normalized.txt")
+	s := config.Source{
+		ID: "decorated",
+		Family: "ipv4",
+		Inputs: []string{
+			"190.93.246.167:443#46.08MB/s-LAX",
+			"104.16.146.116:443#45.87MB/s-LAX",
+			"104.16.123.147:443#45.87MB/s-LAX",
+			"104.16.170.72:443#45.47MB/s-LAX",
+		},
+	}
+	n, err := collectInputs(context.Background(), s, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Fatalf("count=%d want 4", n)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(b))
+	want := []string{
+		"190.93.246.167",
+		"104.16.146.116",
+		"104.16.123.147",
+		"104.16.170.72",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized=%#v want %#v", got, want)
+	}
+}
+
+func TestNormalizeInputRejectsWrongFamily(t *testing.T) {
+	if _, ok := normalizeInputEntry("190.93.246.167:443#LAX", "ipv6"); ok {
+		t.Fatal("IPv4 accepted as IPv6")
+	}
+	if _, ok := normalizeInputEntry("[2606:4700::1111]:443#NRT", "ipv4"); ok {
+		t.Fatal("IPv6 accepted as IPv4")
+	}
 }
