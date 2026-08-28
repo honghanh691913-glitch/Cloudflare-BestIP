@@ -1,9 +1,14 @@
 package reallink
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseUserVLESSURI(t *testing.T) {
@@ -72,5 +77,39 @@ func TestBuildBatchConfigRoutesEachInboundToMatchingCandidate(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %s in %s", want, s)
 		}
+	}
+}
+
+func TestV073RealDelayUsesMinLikeV2rayN(t *testing.T) {
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			time.Sleep(80 * time.Millisecond)
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	tr := &http.Transport{IdleConnTimeout: 5 * time.Second, MaxIdleConnsPerHost: 2}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: time.Second}
+
+	values := make([]float64, 0, 2)
+	for i := 0; i < 2; i++ {
+		start := time.Now()
+		if err := doLatencyRequestWithClient(context.Background(), client, srv.URL); err != nil {
+			t.Fatal(err)
+		}
+		values = append(values, float64(time.Since(start).Microseconds())/1000)
+	}
+	sort.Float64s(values)
+	if values[0] >= values[1] {
+		t.Fatalf("expected min/second sample to be faster, got %#v", values)
+	}
+	if values[0] > 60 {
+		t.Fatalf("minimum sample unexpectedly high: %#v", values)
 	}
 }

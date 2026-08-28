@@ -35,6 +35,7 @@ type Result struct {
 	SpeedMB         float64   `json:"speed_mb,omitempty"`
 	SpeedTested     bool      `json:"speed_tested"`
 	RealLatencyMS   float64   `json:"real_latency_ms,omitempty"`
+	RealFirstMS     float64   `json:"real_first_ms,omitempty"`
 	RealTested      bool      `json:"real_tested,omitempty"`
 	RealSpeedMB     float64   `json:"real_speed_mb,omitempty"`
 	RealSpeedTested bool      `json:"real_speed_tested,omitempty"`
@@ -500,6 +501,7 @@ func (m *Manager) filterByRealLink(ctx context.Context, sourceID string, s confi
 				return
 			}
 			out[i].RealTested = true
+			out[i].RealFirstMS = rr.FirstMS
 			out[i].TestedAt = time.Now()
 			if rr.Error != "" {
 				out[i].Qualified = false
@@ -510,14 +512,14 @@ func (m *Manager) filterByRealLink(ctx context.Context, sourceID string, s confi
 				if s.RealLatencyMaxMS > 0 && rr.LatencyMS > s.RealLatencyMaxMS {
 					out[i].Qualified = false
 					out[i].RejectReason = fmt.Sprintf("真连接延迟 %.1fms > %.1fms", rr.LatencyMS, s.RealLatencyMaxMS)
-					m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms NOT_QUALIFIED", completed, total, rr.Candidate, rr.LatencyMS)
+					m.logf(sourceID, "REAL %d/%d ip=%s first=%.1fms delay=%.1fms NOT_QUALIFIED", completed, total, rr.Candidate, rr.FirstMS, rr.LatencyMS)
 				} else {
 					out[i].Qualified = true
 					out[i].RejectReason = ""
 					passMu.Lock()
 					passedCount++
 					passMu.Unlock()
-					m.logf(sourceID, "REAL %d/%d ip=%s latency=%.1fms QUALIFIED", completed, total, rr.Candidate, rr.LatencyMS)
+					m.logf(sourceID, "REAL %d/%d ip=%s first=%.1fms delay=%.1fms QUALIFIED", completed, total, rr.Candidate, rr.FirstMS, rr.LatencyMS)
 				}
 			}
 			m.updateHistoryRow(sourceID, out[i])

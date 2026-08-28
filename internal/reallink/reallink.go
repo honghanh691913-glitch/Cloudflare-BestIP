@@ -117,7 +117,8 @@ type Result struct {
 
 type LatencyResult struct {
 	Candidate string  `json:"candidate"`
-	LatencyMS float64 `json:"latency_ms,omitempty"`
+	LatencyMS float64 `json:"latency_ms,omitempty"` // v2rayN-compatible stable delay
+	FirstMS   float64 `json:"first_ms,omitempty"`   // first request including initial proxy/TLS/WS setup
 	Error     string  `json:"error,omitempty"`
 }
 
@@ -228,9 +229,13 @@ func MeasureLatenciesBatch(
 		return nil, err
 	}
 
-	// Global warm-up through the saved node. It is intentionally not timed.
-	warmProxy, _ := url.Parse("http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(ports[0])))
-	_ = doLatencyRequest(ctx, warmProxy, testURL, 8*time.Second)
+	// Match v2rayN: after the batch core starts, wait about one second before
+	// issuing real-delay requests. Startup wait is never counted as node delay.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(1 * time.Second):
+	}
 
 	type job struct {
 		index int
@@ -251,12 +256,22 @@ func MeasureLatenciesBatch(
 			defer wg.Done()
 			for j := range jobs {
 				res := LatencyResult{Candidate: j.ip}
-				proxyURL, _ := url.Parse("http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(j.port)))
 
-				// Candidate-specific first connection is also a warm-up. This
-				// removes first-use ECH/TLS/WS initialization from the reported
-				// latency while formal samples still create fresh connections.
-				_ = doLatencyRequest(ctx, proxyURL, testURL, 10*time.Second)
+				// v2rayN's real delay uses a SOCKS5 proxy and the SAME HttpClient
+				// for two GETs, then reports the minimum. KeepAlive is therefore
+				// intentional: the second request may reuse the established
+				// VLESS/TLS/ECH/WS tunnel. Older BestIP forced a fresh handshake
+				// every sample, which inflated values by ~0.8-3 seconds.
+				proxyURL, _ := url.Parse("socks5://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(j.port)))
+				tr := &http.Transport{
+					Proxy:                 http.ProxyURL(proxyURL),
+					TLSHandshakeTimeout:   6 * time.Second,
+					ResponseHeaderTimeout: 8 * time.Second,
+					IdleConnTimeout:       15 * time.Second,
+					MaxIdleConns:          2,
+					MaxIdleConnsPerHost:   2,
+				}
+				client := &http.Client{Transport: tr, Timeout: 9 * time.Second}
 
 				values := make([]float64, 0, attempts)
 				var lastErr error
@@ -266,12 +281,28 @@ func MeasureLatenciesBatch(
 						break
 					}
 					start := time.Now()
-					if err := doLatencyRequest(ctx, proxyURL, testURL, 10*time.Second); err != nil {
+					if err := doLatencyRequestWithClient(ctx, client, testURL); err != nil {
 						lastErr = err
 						break
 					}
-					values = append(values, float64(time.Since(start).Microseconds())/1000)
+					ms := float64(time.Since(start).Microseconds()) / 1000
+					values = append(values, ms)
+					if i == 0 {
+						res.FirstMS = ms
+					}
+					if i+1 < attempts {
+						select {
+						case <-ctx.Done():
+							lastErr = ctx.Err()
+						case <-time.After(100 * time.Millisecond):
+						}
+						if lastErr != nil {
+							break
+						}
+					}
 				}
+				tr.CloseIdleConnections()
+
 				if len(values) == 0 {
 					if lastErr == nil {
 						lastErr = errors.New("没有取得真连接延迟")
@@ -279,12 +310,8 @@ func MeasureLatenciesBatch(
 					res.Error = lastErr.Error()
 				} else {
 					sort.Float64s(values)
-					if len(values)%2 == 1 {
-						res.LatencyMS = values[len(values)/2]
-					} else {
-						n := len(values)
-						res.LatencyMS = (values[n/2-1] + values[n/2]) / 2
-					}
+					// v2rayN: two samples, return the smallest positive delay.
+					res.LatencyMS = values[0]
 				}
 				done <- item{index: j.index, res: res}
 			}
@@ -322,20 +349,12 @@ func MeasureLatenciesBatch(
 	return results, nil
 }
 
-func doLatencyRequest(ctx context.Context, proxyURL *url.URL, testURL string, timeout time.Duration) error {
-	tr := &http.Transport{
-		Proxy:                 http.ProxyURL(proxyURL),
-		DisableKeepAlives:     true,
-		TLSHandshakeTimeout:   6 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
-	}
-	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: timeout}
+func doLatencyRequestWithClient(ctx context.Context, client *http.Client, testURL string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "BestIP-RealLink/2")
+	req.Header.Set("User-Agent", "BestIP-RealLink/3")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
